@@ -1,7 +1,7 @@
 # workers/pc_anom.py
 import numpy as np
 import open3d as o3d
-from PySide6.QtCore import QObject, Signal, QThread
+from PySide6.QtCore import QObject, Signal, QThread,Slot
 import cv2
 import uuid
 import logging
@@ -288,21 +288,21 @@ class AnomPCWorker(QObject):
         
         return None
     
-    @QThread.slot()
+    @Slot()
     def start(self):
         """Start the worker"""
         self.started.emit()
         self.is_running = True
         logger.info("Anomaly point cloud worker started")
     
-    @QThread.slot(object)
+    @Slot(object)
     def update_rgb_reference(self, rgb_data):
         """Update reference to RGB point cloud data"""
         with self.lock:
             self.rgb_points = rgb_data.get('points')
             self.rgb_colors = rgb_data.get('colors')
     
-    @QThread.slot(object)
+    @Slot(object)
     def process_anomaly(self, anomaly_data):
         """Process anomaly detection results
         
@@ -391,7 +391,7 @@ class AnomPCWorker(QObject):
             logger.error(f"Error processing anomaly: {str(e)}")
             self.error.emit(f"Anomaly processing error: {str(e)}")
     
-    @QThread.slot(object)
+    Slot(object)
     def update_frame_data(self, frame_data):
         """Update current frame data from capture worker"""
         self.current_frame_data = frame_data
@@ -413,7 +413,7 @@ class AnomPCWorker(QObject):
                     })
             return summary
     
-    @QThread.slot()
+    @Slot()
     def stop(self):
         """Stop the worker"""
         self.is_running = False

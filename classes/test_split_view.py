@@ -6,86 +6,159 @@ from PySide6.QtCore import Qt, QThread, Signal, Slot, QTimer
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QHBoxLayout, QPushButton, QLabel, QSplitter)
 from PySide6.QtGui import QPixmap, QImage
-import threading
-import queue
 import cv2
 
 # Import the workers
-from workers.capture import CaptureWorker
-from workers.infer import InferWorker
-from workers.pc_rgb import RgbPCWorker
-from workers.pc_anom import AnomPCWorker
+from capture import CaptureWorker
+from infer import InferWorker
+from pc_rgb import RgbPCWorker
+from pc_anom import AnomPCWorker
 
 
-class Open3DWidget(QWidget):
-    """Widget for displaying Open3D point cloud"""
+class PointCloudWidget(QLabel):
+    """Widget for displaying point cloud using offscreen rendering"""
     
     def __init__(self, window_name="3D View"):
         super().__init__()
         self.window_name = window_name
-        self.vis = None
         self.point_cloud = o3d.geometry.PointCloud()
-        self.update_queue = queue.Queue()
-        self.vis_thread = None
-        self.is_running = False
         
-    def start_visualization(self):
-        """Start the visualization in a separate thread"""
-        self.is_running = True
-        self.vis_thread = threading.Thread(target=self._vis_thread_func)
-        self.vis_thread.start()
+        # Offscreen renderer
+        self.renderer = o3d.visualization.rendering.OffscreenRenderer(640, 480)
+        self.setup_renderer()
         
-    def _vis_thread_func(self):
-        """Visualization thread function"""
-        # Create visualizer
-        self.vis = o3d.visualization.Visualizer()
-        self.vis.create_window(window_name=self.window_name, width=640, height=480)
+        # Set initial black image
+        self.setMinimumSize(640, 480)
+        self.setMaximumSize(640, 480)
+        self.setStyleSheet("border: 1px solid #333;")
+        self.setScaledContents(True)
         
-        # Add empty point cloud
-        self.vis.add_geometry(self.point_cloud)
+        # Camera parameters
+        self.view_distance = 2.0
+        self.camera_angle = 0
+        self.camera_elevation = 30
         
-        # Set render options
-        render_option = self.vis.get_render_option()
-        render_option.point_size = 2.0
-        render_option.background_color = np.array([0.1, 0.1, 0.1])
+        # Initial render
+        self.render_point_cloud()
         
-        # Set initial view
-        view_control = self.vis.get_view_control()
-        view_control.set_zoom(0.8)
+    def setup_renderer(self):
+        """Setup the offscreen renderer"""
+        # Set background color
+        self.renderer.scene.set_background([0.1, 0.1, 0.1, 1.0])
         
-        # Main visualization loop
-        while self.is_running:
-            # Check for updates
-            try:
-                update_data = self.update_queue.get(timeout=0.01)
-                if update_data is not None:
-                    points = update_data.get('points', np.array([]))
-                    colors = update_data.get('colors', np.array([]))
-                    
-                    if points.shape[0] > 0:
-                        self.point_cloud.points = o3d.utility.Vector3dVector(points)
-                        if colors.shape[0] == points.shape[0]:
-                            self.point_cloud.colors = o3d.utility.Vector3dVector(colors)
-                        self.vis.update_geometry(self.point_cloud)
-            except queue.Empty:
-                pass
-            
-            # Update visualization
-            self.vis.poll_events()
-            self.vis.update_renderer()
+        # Setup lighting
+        self.renderer.scene.scene.set_sun_light(
+            [0.577, -0.577, -0.577],  # direction
+            [1.0, 1.0, 1.0],  # color
+            100000  # intensity
+        )
+        self.renderer.scene.scene.enable_sun_light(True)
         
-        # Cleanup
-        self.vis.destroy_window()
+        # Add ambient light
+        self.renderer.scene.scene.set_indirect_light_intensity(30000)
         
     def update_point_cloud(self, data):
-        """Queue point cloud update"""
-        self.update_queue.put(data)
+        """Update point cloud with new data"""
+        points = data.get('points', np.array([]))
+        colors = data.get('colors', np.array([]))
         
-    def stop_visualization(self):
-        """Stop the visualization thread"""
-        self.is_running = False
-        if self.vis_thread:
-            self.vis_thread.join()
+        if points.shape[0] > 0:
+            self.point_cloud.points = o3d.utility.Vector3dVector(points)
+            if colors.shape[0] == points.shape[0]:
+                self.point_cloud.colors = o3d.utility.Vector3dVector(colors)
+            else:
+                # Default color if not provided
+                default_colors = np.ones((points.shape[0], 3)) * 0.5
+                self.point_cloud.colors = o3d.utility.Vector3dVector(default_colors)
+            
+            # Update visualization
+            self.render_point_cloud()
+            
+    def render_point_cloud(self):
+        """Render the point cloud to an image"""
+        # Clear previous geometry
+        self.renderer.scene.clear_geometry()
+        
+        if len(self.point_cloud.points) > 0:
+            # Create material for point cloud
+            mat = o3d.visualization.rendering.MaterialRecord()
+            mat.shader = "defaultUnlit"
+            mat.point_size = 3.0
+            
+            # Add point cloud to scene
+            self.renderer.scene.add_geometry("pointcloud", self.point_cloud, mat)
+            
+            # Calculate bounding box center
+            bbox = self.point_cloud.get_axis_aligned_bounding_box()
+            center = bbox.get_center()
+            extent = bbox.get_extent()
+            max_extent = max(extent)
+            
+            # Setup camera
+            if max_extent > 0:
+                # Calculate camera position
+                theta = np.radians(self.camera_angle)
+                phi = np.radians(self.camera_elevation)
+                
+                camera_distance = max_extent * self.view_distance
+                
+                eye = center + np.array([
+                    camera_distance * np.cos(phi) * np.sin(theta),
+                    camera_distance * np.cos(phi) * np.cos(theta),
+                    camera_distance * np.sin(phi)
+                ])
+                
+                # Setup camera
+                self.renderer.setup_camera(
+                    60,  # field of view
+                    center,  # look at
+                    eye,  # camera position
+                    [0, 0, 1]  # up vector
+                )
+        
+        # Render to image
+        img = self.renderer.render_to_image()
+        
+        # Convert to QPixmap and display
+        img_array = np.asarray(img)
+        height, width, channel = img_array.shape
+        bytes_per_line = 3 * width
+        
+        q_image = QImage(img_array.data, width, height, bytes_per_line, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(q_image)
+        self.setPixmap(pixmap)
+        
+    def rotate_camera(self, angle_delta):
+        """Rotate camera around the point cloud"""
+        self.camera_angle += angle_delta
+        self.render_point_cloud()
+        
+    def elevate_camera(self, elevation_delta):
+        """Change camera elevation"""
+        self.camera_elevation = np.clip(self.camera_elevation + elevation_delta, -89, 89)
+        self.render_point_cloud()
+        
+    def zoom_camera(self, zoom_factor):
+        """Zoom camera in/out"""
+        self.view_distance = np.clip(self.view_distance * zoom_factor, 0.5, 5.0)
+        self.render_point_cloud()
+        
+    def mousePressEvent(self, event):
+        """Handle mouse press for camera control"""
+        self.last_mouse_pos = event.pos()
+        
+    def mouseMoveEvent(self, event):
+        """Handle mouse move for camera rotation"""
+        if event.buttons() & Qt.LeftButton:
+            delta = event.pos() - self.last_mouse_pos
+            self.rotate_camera(delta.x() * 0.5)
+            self.elevate_camera(-delta.y() * 0.5)
+            self.last_mouse_pos = event.pos()
+            
+    def wheelEvent(self, event):
+        """Handle mouse wheel for zoom"""
+        zoom_factor = 1.1 if event.angleDelta().y() > 0 else 0.9
+        self.zoom_camera(zoom_factor)
 
 
 class SplitView3DTest(QMainWindow):
@@ -94,7 +167,7 @@ class SplitView3DTest(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Split View 3D Point Cloud Test")
-        self.setGeometry(100, 100, 1400, 800)
+        self.setGeometry(100, 100, 1400, 600)
         
         # Workers
         self.capture_worker = None
@@ -107,6 +180,11 @@ class SplitView3DTest(QMainWindow):
         self.infer_thread = QThread()
         self.rgb_pc_thread = QThread()
         self.anom_pc_thread = QThread()
+        
+        # Camera rotation timer
+        self.rotation_timer = QTimer()
+        self.rotation_timer.timeout.connect(self.auto_rotate)
+        self.auto_rotation_enabled = False
         
         # Setup UI
         self.setup_ui()
@@ -135,6 +213,11 @@ class SplitView3DTest(QMainWindow):
         self.stop_button.setEnabled(False)
         control_panel.addWidget(self.stop_button)
         
+        self.rotate_button = QPushButton("Auto Rotate")
+        self.rotate_button.setCheckable(True)
+        self.rotate_button.toggled.connect(self.toggle_rotation)
+        control_panel.addWidget(self.rotate_button)
+        
         self.status_label = QLabel("Status: Ready")
         control_panel.addWidget(self.status_label)
         control_panel.addStretch()
@@ -148,7 +231,7 @@ class SplitView3DTest(QMainWindow):
         rgb_container = QWidget()
         rgb_layout = QVBoxLayout()
         rgb_layout.addWidget(QLabel("RGB Point Cloud"))
-        self.rgb_view = Open3DWidget("RGB Point Cloud")
+        self.rgb_view = PointCloudWidget("RGB Point Cloud")
         rgb_layout.addWidget(self.rgb_view)
         self.rgb_info_label = QLabel("Points: 0")
         rgb_layout.addWidget(self.rgb_info_label)
@@ -158,7 +241,7 @@ class SplitView3DTest(QMainWindow):
         anom_container = QWidget()
         anom_layout = QVBoxLayout()
         anom_layout.addWidget(QLabel("Anomaly Point Cloud"))
-        self.anom_view = Open3DWidget("Anomaly Point Cloud")
+        self.anom_view = PointCloudWidget("Anomaly Point Cloud")
         anom_layout.addWidget(self.anom_view)
         self.anom_info_label = QLabel("Anomalies: 0")
         anom_layout.addWidget(self.anom_info_label)
@@ -169,6 +252,11 @@ class SplitView3DTest(QMainWindow):
         splitter.setSizes([700, 700])
         
         main_layout.addWidget(splitter)
+        
+        # Instructions
+        instructions = QLabel("Use mouse to rotate view, scroll wheel to zoom")
+        instructions.setStyleSheet("color: #666; padding: 5px;")
+        main_layout.addWidget(instructions)
         
     def setup_workers(self):
         """Setup all workers and connections"""
@@ -181,7 +269,7 @@ class SplitView3DTest(QMainWindow):
             },
             "waypoints": {
                 "wp1": {
-                "position": [10, -85, 5, -85, -90, 0],
+                    "position": [10, -85, 5, -85, -90, 0],
                     "description": "Front view",
                     "speed": 0.5
                 },
@@ -234,10 +322,6 @@ class SplitView3DTest(QMainWindow):
         self.rgb_pc_thread.start()
         self.anom_pc_thread.start()
         
-        # Start visualization widgets
-        self.rgb_view.start_visualization()
-        self.anom_view.start_visualization()
-        
     @Slot()
     def start_capture(self):
         """Start the capture and processing pipeline"""
@@ -261,6 +345,21 @@ class SplitView3DTest(QMainWindow):
         self.anom_pc_worker.stop()
         
         self.update_status("Stopping capture...")
+        
+    @Slot(bool)
+    def toggle_rotation(self, checked):
+        """Toggle auto rotation"""
+        self.auto_rotation_enabled = checked
+        if checked:
+            self.rotation_timer.start(50)  # 20 FPS
+        else:
+            self.rotation_timer.stop()
+            
+    @Slot()
+    def auto_rotate(self):
+        """Auto rotate both views"""
+        self.rgb_view.rotate_camera(2)
+        self.anom_view.rotate_camera(2)
         
     @Slot(object)
     def on_frame_captured(self, frame_data):
@@ -314,9 +413,8 @@ class SplitView3DTest(QMainWindow):
         self.rgb_pc_worker.stop()
         self.anom_pc_worker.stop()
         
-        # Stop visualizations
-        self.rgb_view.stop_visualization()
-        self.anom_view.stop_visualization()
+        # Stop auto rotation
+        self.rotation_timer.stop()
         
         # Wait for threads to finish
         self.capture_thread.quit()

@@ -1,7 +1,7 @@
 # workers/pc_rgb.py
 import numpy as np
 import open3d as o3d
-from PySide6.QtCore import QObject, Signal, QThread
+from PySide6.QtCore import QObject, Signal, QThread,Slot
 import logging
 from collections import deque
 import threading
@@ -206,14 +206,14 @@ class RgbPCWorker(QObject):
                 'num_points': all_points.shape[0]
             }
     
-    @QThread.slot()
+    @Slot()
     def start(self):
         """Start the worker"""
         self.started.emit()
         self.is_running = True
         logger.info("RGB point cloud worker started")
     
-    @QThread.slot(object)
+    @Slot(object)
     def process_frame(self, frame_data):
         """Process frame data from capture worker
         
@@ -291,7 +291,7 @@ class RgbPCWorker(QObject):
             self.frame_counter = 0
             logger.info("Point cloud cleared")
     
-    @QThread.slot()
+    @Slot()
     def stop(self):
         """Stop the worker"""
         self.is_running = False
