@@ -109,6 +109,11 @@ class InferWorker(QObject):
             # Run inference
             preds = self.inferencer.predict(rgb_frame)
             anomaly_map = preds.anomaly_map.squeeze().cpu().numpy()
+            
+            # Ensure anomaly map is 2D
+            if anomaly_map.ndim > 2:
+                anomaly_map = anomaly_map.squeeze()
+            
             anomaly_score = float(preds.pred_score)
             
             # Accumulate data
@@ -123,6 +128,11 @@ class InferWorker(QObject):
             # Log progress
             if len(self.accumulated_anomaly_maps) % 10 == 0:
                 self.error.emit(f"Accumulated {len(self.accumulated_anomaly_maps)} frames")
+            
+            # Log anomaly map shape on first frame
+            if len(self.accumulated_anomaly_maps) == 1:
+                self.error.emit(f"Anomaly map shape: {anomaly_map.shape}, range: [{np.min(anomaly_map):.3f}, {np.max(anomaly_map):.3f}]")
+                self.error.emit(f"Depth shape: {frame_data['depth'].shape}, RGB shape: {bgr_frame.shape}")
             
             # Normalize for live view
             normalized_map = anomaly_map / np.max(anomaly_map) if np.max(anomaly_map) > 0 else anomaly_map

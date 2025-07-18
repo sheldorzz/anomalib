@@ -88,9 +88,21 @@ class PointCloudGenerator:
         """Create point cloud colored by anomaly scores"""
         height, width = depth_image.shape
         
+        # Ensure anomaly map is 2D
+        if anomaly_map.ndim > 2:
+            anomaly_map = anomaly_map.squeeze()
+        
+        # Always resize anomaly map to match depth image dimensions
         if anomaly_map.shape != (height, width):
-            anomaly_map = cv2.resize(anomaly_map.astype(np.float32), (width, height), 
-                                    interpolation=cv2.INTER_LINEAR)
+            try:
+                anomaly_map = cv2.resize(anomaly_map.astype(np.float32), (width, height), 
+                                        interpolation=cv2.INTER_LINEAR)
+            except Exception as e:
+                logger.error(f"Failed to resize anomaly map: {e}")
+                # Return empty cloud on error
+                return pv.PolyData()
+        else:
+            anomaly_map = anomaly_map.astype(np.float32)
         
         fx, fy = camera_matrix[0, 0], camera_matrix[1, 1]
         cx, cy = camera_matrix[0, 2], camera_matrix[1, 2]
@@ -197,6 +209,7 @@ class PyVistaViewer(QWidget):
         self.plotter.clear()
         self.plotter.add_axes_at_origin(labels_off=False)
         self.info_label.setText("Cleared")
+        self.plotter.render()
         
     def show_voxelized(self, voxel_mesh, color='lightblue', opacity=0.8):
         """Show voxelized mesh"""
@@ -204,6 +217,8 @@ class PyVistaViewer(QWidget):
         if voxel_mesh.n_points > 0:
             self.plotter.add_mesh(voxel_mesh, color=color, opacity=opacity, name="voxels")
             self.info_label.setText(f"Voxels: {voxel_mesh.n_cells:,}")
+            self.plotter.reset_camera()
+            self.plotter.render()
     
     def show_anomaly_voxels(self, voxel_mesh):
         """Show anomaly voxels with color mapping"""
@@ -212,6 +227,8 @@ class PyVistaViewer(QWidget):
             self.plotter.add_mesh(voxel_mesh, scalars="Anomaly_Score", cmap='jet', 
                                 opacity=0.9, name="anomaly_voxels")
             self.info_label.setText(f"Anomaly Voxels: {voxel_mesh.n_cells:,}")
+            self.plotter.reset_camera()
+            self.plotter.render()
     
     def add_bounding_box(self, bbox_id, bounds, color='red', opacity=0.5):
         """Add a bounding box"""
@@ -596,7 +613,19 @@ class RobotVision3DApp(QMainWindow):
         self.log("Processing final data...")
         self.capture_status_label.setText("Voxelizing...")
         
+        # Check if we have data
+        if not data or len(data.get('anomaly_maps', [])) == 0:
+            self.log("No data to process!")
+            self.status_label.setText("No data")
+            return
+        
         try:
+            # Log data info
+            self.log(f"Processing {len(data['anomaly_maps'])} frames")
+            if len(data['anomaly_maps']) > 0:
+                self.log(f"Anomaly map size: {data['anomaly_maps'][0].shape}")
+                self.log(f"Depth image size: {data['depth_images'][0].shape}")
+            
             # Create combined point clouds
             all_normal_points = []
             all_anomaly_points = []
@@ -611,8 +640,18 @@ class RobotVision3DApp(QMainWindow):
                 data["anomaly_maps"], data["rgb_images"], data["depth_images"],
                 data["transforms"], data["camera_matrices"]
             )):
+                # Resize anomaly map to match depth image size
+                try:
+                    # Ensure anomaly map is 2D
+                    if amap.ndim > 2:
+                        amap = amap.squeeze()
+                    amap_resized = cv2.resize(amap.astype(np.float32), (width, height), interpolation=cv2.INTER_LINEAR)
+                except Exception as e:
+                    self.log(f"Error resizing anomaly map: {e}, skipping frame {i}")
+                    continue
+                
                 # Accumulate votes
-                combined_anomaly_map += (amap > data["pixel_threshold"]).astype(np.float32)
+                combined_anomaly_map += (amap_resized > data["pixel_threshold"]).astype(np.float32)
                 
                 # Create point clouds
                 normal_cloud = self.pc_generator.create_point_cloud(
@@ -625,6 +664,12 @@ class RobotVision3DApp(QMainWindow):
             # Normalize votes
             combined_anomaly_map /= len(data["anomaly_maps"])
             
+            # Log voting results
+            votes_above_threshold = np.sum(combined_anomaly_map > 0.3)
+            total_pixels = combined_anomaly_map.size
+            self.log(f"Voting complete: {votes_above_threshold:,}/{total_pixels:,} pixels "
+                    f"({votes_above_threshold/total_pixels*100:.1f}%) voted as anomalous")
+            
             # Now create anomaly point cloud from voted map
             vote_threshold = 0.3  # At least 30% of views should agree
             
@@ -632,6 +677,7 @@ class RobotVision3DApp(QMainWindow):
                 data["rgb_images"], data["depth_images"], 
                 data["transforms"], data["camera_matrices"]
             )):
+                # Use the combined voted anomaly map for all frames
                 anomaly_cloud = self.pc_generator.create_anomaly_point_cloud(
                     rgb, depth, cam_matrix, combined_anomaly_map, transform
                 )
@@ -646,33 +692,56 @@ class RobotVision3DApp(QMainWindow):
             # Combine all points
             if all_normal_points:
                 combined_normal = np.vstack(all_normal_points)
+                self.log(f"Combined normal points shape: {combined_normal.shape}")
             else:
                 combined_normal = np.array([])
+                self.log("No normal points to combine")
                 
             if all_anomaly_points:
                 combined_anomaly = np.vstack(all_anomaly_points)
                 combined_scores = np.hstack(all_anomaly_scores)
+                self.log(f"Combined anomaly points shape: {combined_anomaly.shape}")
             else:
                 combined_anomaly = np.array([])
                 combined_scores = np.array([])
+                self.log("No anomaly points to combine")
             
             self.log(f"Combined points: Normal={len(combined_normal):,}, Anomaly={len(combined_anomaly):,}")
             
             # Voxelize
             voxel_size = self.voxel_size_spin.value() / 1000.0
-            normal_voxels = self.voxelize_points(combined_normal, voxel_size)
-            anomaly_voxels = self.voxelize_anomaly_points(combined_anomaly, combined_scores, voxel_size)
+            self.log(f"Voxelizing with size {voxel_size*1000:.1f}mm")
+            
+            try:
+                normal_voxels = self.voxelize_points(combined_normal, voxel_size)
+                anomaly_voxels = self.voxelize_anomaly_points(combined_anomaly, combined_scores, voxel_size)
+                
+                self.log(f"Voxelized: Normal={normal_voxels.n_cells if normal_voxels.n_points > 0 else 0:,}, "
+                        f"Anomaly={anomaly_voxels.n_cells if anomaly_voxels.n_points > 0 else 0:,}")
+            except Exception as e:
+                self.log(f"Voxelization error: {e}")
+                import traceback
+                traceback.print_exc()
+                normal_voxels = pv.PolyData()
+                anomaly_voxels = pv.PolyData()
             
             # Detect 3D anomaly regions
-            bounding_boxes = self.detect_anomaly_regions(
-                anomaly_voxels, voxel_size, data["voi_bounds"], 
-                data["min_anomaly_volume"], data["max_anomaly_volume"]
-            )
-            
-            self.log(f"Detected {len(bounding_boxes)} anomaly regions")
+            try:
+                bounding_boxes = self.detect_anomaly_regions(
+                    anomaly_voxels, voxel_size, data["voi_bounds"], 
+                    data["min_anomaly_volume"], data["max_anomaly_volume"]
+                )
+                
+                self.log(f"Detected {len(bounding_boxes)} anomaly regions")
+            except Exception as e:
+                self.log(f"Error detecting anomaly regions: {e}")
+                bounding_boxes = []
             
             # Save annotated images
-            self.save_annotated_images(bounding_boxes, data)
+            try:
+                self.save_annotated_images(bounding_boxes, data)
+            except Exception as e:
+                self.log(f"Error saving annotated images: {e}")
             
             # Update visualization
             self.update_voxel_visualization(normal_voxels, anomaly_voxels, bounding_boxes)
@@ -684,18 +753,27 @@ class RobotVision3DApp(QMainWindow):
     
     def voxelize_points(self, points, voxel_size):
         """Voxelize point cloud"""
-        if len(points) == 0:
+        if points is None or len(points) == 0 or points.size == 0:
+            self.log("No points to voxelize")
             return pv.PolyData()
+        
+        # Ensure points is 2D array
+        if points.ndim == 1:
+            points = points.reshape(-1, 3)
         
         # Get bounds
         min_bound = np.min(points, axis=0)
         max_bound = np.max(points, axis=0)
+        
+        self.log(f"Point cloud bounds: [{min_bound[0]:.2f}, {min_bound[1]:.2f}, {min_bound[2]:.2f}] "
+                f"to [{max_bound[0]:.2f}, {max_bound[1]:.2f}, {max_bound[2]:.2f}]")
         
         # Calculate voxel indices
         voxel_indices = np.floor((points - min_bound) / voxel_size).astype(int)
         
         # Get unique voxels
         unique_voxels = np.unique(voxel_indices, axis=0)
+        self.log(f"Created {len(unique_voxels)} unique voxels from {len(points)} points")
         
         # Create voxel centers
         voxel_centers = min_bound + (unique_voxels + 0.5) * voxel_size
@@ -710,8 +788,13 @@ class RobotVision3DApp(QMainWindow):
     
     def voxelize_anomaly_points(self, points, scores, voxel_size):
         """Voxelize anomaly points with scores"""
-        if len(points) == 0:
+        if points is None or len(points) == 0 or points.size == 0:
+            self.log("No anomaly points to voxelize")
             return pv.PolyData()
+        
+        # Ensure points is 2D array
+        if points.ndim == 1:
+            points = points.reshape(-1, 3)
         
         # Get bounds
         min_bound = np.min(points, axis=0)
@@ -735,6 +818,11 @@ class RobotVision3DApp(QMainWindow):
             center = min_bound + (np.array(voxel_idx) + 0.5) * voxel_size
             voxel_centers.append(center)
             voxel_scores.append(np.mean(scores_list))
+        
+        self.log(f"Created {len(voxel_centers)} anomaly voxels")
+        
+        if len(voxel_centers) == 0:
+            return pv.PolyData()
         
         # Create voxel mesh
         voxel_cloud = pv.PolyData(np.array(voxel_centers))
@@ -817,6 +905,8 @@ class RobotVision3DApp(QMainWindow):
     def save_annotated_images(self, bounding_boxes, data):
         """Save 2D annotated images for each anomaly"""
         session_dir = Path(data["session_dir"])
+        session_dir.mkdir(parents=True, exist_ok=True)
+        self.log(f"Saving annotated images to: {session_dir}")
         
         for bbox in bounding_boxes:
             best_img_idx = None
@@ -856,10 +946,20 @@ class RobotVision3DApp(QMainWindow):
                 
                 # Draw anomaly overlay
                 h, w = img.shape[:2]
-                overlay = cv2.applyColorMap(
-                    (anomaly_map * 255).astype(np.uint8), cv2.COLORMAP_JET
-                )
-                overlay = cv2.resize(overlay, (w, h))
+                
+                # Resize anomaly map to match image size
+                # Ensure anomaly map is 2D
+                if anomaly_map.ndim > 2:
+                    anomaly_map = anomaly_map.squeeze()
+                anomaly_map_resized = cv2.resize(anomaly_map.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+                
+                # Normalize to 0-255 range if needed
+                if anomaly_map_resized.max() <= 1.0:
+                    anomaly_map_uint8 = (anomaly_map_resized * 255).astype(np.uint8)
+                else:
+                    anomaly_map_uint8 = anomaly_map_resized.astype(np.uint8)
+                
+                overlay = cv2.applyColorMap(anomaly_map_uint8, cv2.COLORMAP_JET)
                 img = cv2.addWeighted(img, 0.7, overlay, 0.3, 0)
                 
                 # Save annotated image
@@ -867,14 +967,39 @@ class RobotVision3DApp(QMainWindow):
                 cv2.imwrite(str(filename), img)
                 
                 self.log(f"Saved anomaly {bbox['id']} to {filename.name}")
+        
+        if len(bounding_boxes) > 0:
+            self.log(f"All annotated images saved to: {session_dir}")
     
     def update_voxel_visualization(self, normal_voxels, anomaly_voxels, bounding_boxes):
         """Update visualization with voxels and bounding boxes"""
         self.capture_status_label.setText(f"Voxelized - {len(bounding_boxes)} Anomalies Detected")
         
+        # Check if we have valid voxel meshes
+        if normal_voxels is None or normal_voxels.n_points == 0:
+            self.log("Warning: No normal voxels to display")
+        else:
+            self.log(f"Displaying {normal_voxels.n_cells} normal voxels")
+            
+        if anomaly_voxels is None or anomaly_voxels.n_points == 0:
+            self.log("Warning: No anomaly voxels to display")
+        else:
+            self.log(f"Displaying {anomaly_voxels.n_cells} anomaly voxels")
+        
         # Show voxelized clouds
-        self.normal_viewer.show_voxelized(normal_voxels)
-        self.anomaly_viewer.show_anomaly_voxels(anomaly_voxels)
+        if normal_voxels is not None and normal_voxels.n_points > 0:
+            self.normal_viewer.show_voxelized(normal_voxels)
+        else:
+            self.normal_viewer.clear()
+            self.normal_viewer.info_label.setText("No normal voxels")
+            self.normal_viewer.plotter.render()
+        
+        if anomaly_voxels is not None and anomaly_voxels.n_points > 0:
+            self.anomaly_viewer.show_anomaly_voxels(anomaly_voxels)
+        else:
+            self.anomaly_viewer.clear()
+            self.anomaly_viewer.info_label.setText("No anomaly voxels")
+            self.anomaly_viewer.plotter.render()
         
         # Add bounding boxes
         for bbox in bounding_boxes:
@@ -893,8 +1018,18 @@ class RobotVision3DApp(QMainWindow):
             label = f"A{bbox['id']}: {bbox['avg_score']:.2f}"
             self.anomaly_viewer.add_bbox_label(bbox["id"], label, bbox["center"])
         
+        # Log bounding box info
+        for bbox in bounding_boxes:
+            self.log(f"Anomaly {bbox['id']}: {bbox['num_voxels']} voxels, score={bbox['avg_score']:.3f}")
+        
         self.log("Visualization complete")
         self.status_label.setText("Complete")
+        
+        # Reset camera to show all content and render
+        self.normal_viewer.plotter.reset_camera()
+        self.anomaly_viewer.plotter.reset_camera()
+        self.normal_viewer.plotter.render()
+        self.anomaly_viewer.plotter.render()
     
     def on_capture_finished(self):
         """Handle capture finished"""
