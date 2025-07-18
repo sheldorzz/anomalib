@@ -4,6 +4,7 @@ import cv2
 from pathlib import Path
 import json
 import logging
+import traceback
 from typing import Optional, Dict, Any
 from datetime import datetime
 
@@ -458,6 +459,9 @@ class PyVistaViewer(QWidget):
 class RobotVision3DApp(QMainWindow):
     """Main application for 3D robot vision with anomaly detection"""
     
+    # Add signal to trigger processing
+    trigger_processing = Signal()
+    
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Robot Vision 3D - Anomaly Detection")
@@ -801,17 +805,23 @@ class RobotVision3DApp(QMainWindow):
             self.log(f"Error starting capture: {e}")
     
     def stop_capture(self):
-        """Stop capture and inference"""
+        """Stop capture and trigger processing"""
         try:
+            # Only stop the capture worker, not the inference worker
             if self.capture_worker:
                 self.capture_worker.stop_capture()
-            if self.infer_worker:
-                self.infer_worker.stop_inference()
                 
             self.start_capture_btn.setEnabled(True)
             self.stop_capture_btn.setEnabled(False)
-            self.status_label.setText("Stopped")
-            self.log("Stopped capture and inference")
+            self.status_label.setText("Stopped - Processing...")
+            self.log("Stopped capture")
+            
+            # Trigger final processing after stopping capture
+            # The inference worker will stop itself after processing
+            if self.infer_worker and self.infer_thread.isRunning():
+                self.log("Waiting before triggering final anomaly processing...")
+                # Give a small delay to ensure all frames are processed
+                QTimer.singleShot(1000, self.trigger_final_processing)
             
         except Exception as e:
             self.log(f"Error stopping capture: {e}")
@@ -849,6 +859,11 @@ class RobotVision3DApp(QMainWindow):
         self.infer_worker.live_inference_result.connect(self.update_3d_visualization)
         self.infer_worker.capture_completed.connect(self.on_capture_completed)
         self.infer_worker.finished.connect(self.infer_thread.quit)
+        
+        # Connect trigger for final processing
+        self.trigger_processing.connect(self.infer_worker.trigger_final_processing)
+        
+        self.log("Inference worker signals connected")
     
     @Slot(object)
     def process_live_frame(self, frame_data):
@@ -986,6 +1001,7 @@ class RobotVision3DApp(QMainWindow):
     @Slot(object)
     def on_capture_completed(self, accumulated_data):
         """Handle capture completion and process accumulated data"""
+        self.log("=== CAPTURE COMPLETED SIGNAL RECEIVED ===")
         self.log("Capture completed, processing accumulated data...")
         
         try:
@@ -1404,6 +1420,11 @@ class RobotVision3DApp(QMainWindow):
         # Render
         self.normal_viewer.plotter.render()
         self.anomaly_viewer.plotter.render()
+        
+        # Clean up inference worker
+        if self.infer_worker and self.infer_thread.isRunning():
+            self.log("Stopping inference worker...")
+            self.infer_worker.stop_inference()
     
     def clear_all_views(self):
         """Clear all views"""
@@ -1418,6 +1439,23 @@ class RobotVision3DApp(QMainWindow):
         self.status_label.setText("Capture completed")
         self.capture_status_label.setText("Processing for voxelization...")
         self.log("Capture completed")
+        
+        # Trigger post-processing when capture finishes naturally
+        # Add a small delay to ensure all frames have been processed
+        if self.infer_worker and self.infer_thread.isRunning():
+            self.log("Waiting for all frames to be processed...")
+            # Use QTimer to delay the trigger
+            QTimer.singleShot(1000, self.trigger_final_processing)
+        else:
+            self.log("Warning: Inference worker not ready for processing")
+    
+    def trigger_final_processing(self):
+        """Trigger final processing of accumulated data"""
+        if self.infer_worker and self.infer_thread.isRunning():
+            self.log("Triggering anomaly processing...")
+            self.trigger_processing.emit()
+        else:
+            self.log("Warning: Inference worker not available")
     
     def log(self, message):
         """Add message to log"""

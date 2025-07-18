@@ -10,8 +10,6 @@ import logging
 import traceback
 from scipy import ndimage
 from collections import defaultdict
-from sklearn.cluster import DBSCAN
-import open3d as o3d
 
 logger = logging.getLogger(__name__)
 
@@ -93,21 +91,33 @@ class InferWorker(QObject):
             self.inferencer = TorchInferencer(path=str(self.model_path), device=self.device)
             self._running = True
             
-            # NEW: Reset accumulation on start
+            # Reset accumulation on start
             self.reset_accumulation()
+            self.error.emit("Inference started, accumulation reset")
             
             self.ready.emit()
         except Exception as exc:
             self.error.emit(str(exc))
             self.finished.emit()
 
+    @Slot()
+    def trigger_final_processing(self):
+        """Slot to trigger processing of accumulated data"""
+        self.error.emit("trigger_final_processing called")
+        if len(self.accumulated_anomaly_maps) > 0:
+            self.error.emit(f"Processing {len(self.accumulated_anomaly_maps)} accumulated frames...")
+            self.process_accumulated_data()
+        else:
+            self.error.emit("No accumulated data to process")
+    
     def stop_inference(self):
         self._running = False
         
-        # NEW: Process accumulated data before finishing
+        # Process accumulated data before finishing
         if len(self.accumulated_anomaly_maps) > 0:
             self.process_accumulated_data()
-            
+        
+        # Emit finished after processing
         self.finished.emit()
 
     def reset_accumulation(self):
@@ -194,6 +204,10 @@ class InferWorker(QObject):
             self.accumulated_transforms.append(frame_data["transform_matrix"].copy())
             self.accumulated_waypoint_ids.append(frame_data.get("waypoint_id", f"frame_{len(self.accumulated_waypoint_ids)}"))
             
+            # Log accumulation progress every 10 frames
+            if len(self.accumulated_anomaly_maps) % 10 == 0:
+                self.error.emit(f"Accumulated {len(self.accumulated_anomaly_maps)} frames")
+            
             # Detect anomaly regions
             anomaly_regions = self.detect_anomaly_regions(anomaly_map)
             
@@ -241,15 +255,19 @@ class InferWorker(QObject):
         """NEW: Process all accumulated data to compute 3D bounding boxes"""
         try:
             logger.info("Processing accumulated anomaly data...")
+            self.error.emit("Processing accumulated anomaly data...")
             
             if len(self.accumulated_anomaly_maps) == 0:
                 logger.warning("No accumulated data to process")
+                self.error.emit("Warning: No accumulated data to process")
                 return
             
             # Compute global normalization
             all_maps = np.array(self.accumulated_anomaly_maps)
             global_min = np.min(all_maps)
             global_max = np.max(all_maps)
+            
+            logger.info(f"Global anomaly range: [{global_min:.3f}, {global_max:.3f}]")
             
             # Normalize all anomaly maps globally
             normalized_maps = []
@@ -278,9 +296,18 @@ class InferWorker(QObject):
             }
             
             # Emit completed capture data
+            self.error.emit("Emitting capture_completed signal...")
             self.capture_completed.emit(result_data)
+            self.error.emit("capture_completed signal emitted successfully")
             
             logger.info(f"Processed {len(self.accumulated_anomaly_maps)} frames for 3D analysis")
+            self.error.emit(f"Processed {len(self.accumulated_anomaly_maps)} frames for 3D analysis")
+            
+            # Clear accumulated data after processing
+            self.reset_accumulation()
+            
+            # Stop the inference worker after processing
+            self._running = False
             
         except Exception as e:
             self.error.emit(f"Error processing accumulated data: {str(e)}")
