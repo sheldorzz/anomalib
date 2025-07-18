@@ -878,36 +878,57 @@ class RobotVision3DApp(QMainWindow):
             self.log("Cleared existing point clouds")
             
             # Setup inference worker first
+            self.log("Setting up inference worker...")
             self.setup_inference_worker()
             
             # Setup capture worker
+            self.log("Setting up capture worker...")
             self.setup_capture_worker()
             
             # Verify signal connections
             self.log("Signal connections established")
             
             # Start inference worker
+            self.log("Starting inference thread...")
             self.infer_thread.start()
             
             # Wait for inference to be ready
-            QTimer.singleShot(500, lambda: self.capture_thread.start())
+            self.log("Waiting for inference to initialize...")
+            QTimer.singleShot(500, lambda: self.start_capture_delayed())
+            
+        except Exception as e:
+            import traceback
+            error_msg = f"Failed to start capture: {e}\n{traceback.format_exc()}"
+            QMessageBox.critical(self, "Error", error_msg)
+            self.log(error_msg)
+            
+            # Reset state on error
+            self.is_capturing = False
+            self.start_capture_btn.setEnabled(True)
+            self.stop_capture_btn.setEnabled(False)
+            
+    def start_capture_delayed(self):
+        """Start capture after delay"""
+        try:
+            self.log("Starting capture thread...")
+            self.capture_thread.start()
             
             # Update UI
             self.start_capture_btn.setEnabled(False)
             self.stop_capture_btn.setEnabled(True)
             self.status_label.setText("Capturing...")
-            self.log("Started capture and inference")
-            
+            self.log("Capture and inference started successfully")
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to start capture: {e}")
-            self.log(f"Error starting capture: {e}")
+            error_msg = f"Failed to start capture thread: {e}"
+            self.log(error_msg)
+            QMessageBox.critical(self, "Error", error_msg)
     
     def stop_capture(self):
         """Stop capture and inference"""
         try:
             self.is_capturing = False
             
-            if self.capture_worker:
+            if self.capture_worker is not None:
                 self.capture_worker.stop_capture()
             
             # Don't stop inference here - let it finish processing
@@ -922,9 +943,10 @@ class RobotVision3DApp(QMainWindow):
     def setup_capture_worker(self):
         """Setup capture worker and thread"""
         # Clean up any existing threads
-        if hasattr(self, 'capture_thread') and self.capture_thread.isRunning():
-            self.capture_thread.quit()
-            self.capture_thread.wait()
+        if hasattr(self, 'capture_thread') and self.capture_thread is not None:
+            if self.capture_thread.isRunning():
+                self.capture_thread.quit()
+                self.capture_thread.wait()
             
         self.capture_thread = QThread()
         self.capture_worker = CaptureWorker(self.waypoints_config)
@@ -942,9 +964,10 @@ class RobotVision3DApp(QMainWindow):
     def setup_inference_worker(self):
         """Setup inference worker and thread"""
         # Clean up any existing threads
-        if hasattr(self, 'infer_thread') and self.infer_thread.isRunning():
-            self.infer_thread.quit()
-            self.infer_thread.wait()
+        if hasattr(self, 'infer_thread') and self.infer_thread is not None:
+            if self.infer_thread.isRunning():
+                self.infer_thread.quit()
+                self.infer_thread.wait()
             
         self.infer_thread = QThread()
         self.infer_worker = InferWorker(self.model_path)
@@ -978,7 +1001,9 @@ class RobotVision3DApp(QMainWindow):
             self.rgb_widget.update_image(frame_data['rgb'])
         
         # Forward to inference worker
-        if self.infer_worker and hasattr(self.infer_worker, '_running') and self.infer_worker._running:
+        if (self.infer_worker is not None and 
+            hasattr(self.infer_worker, '_running') and 
+            self.infer_worker._running):
             self.infer_worker.process_live_frame(frame_data)
         else:
             logger.warning("Inference worker not ready to process frame")
@@ -1093,6 +1118,10 @@ class RobotVision3DApp(QMainWindow):
         self.capture_complete = True
         self.is_capturing = False
         
+        # Clean up capture references
+        self.capture_worker = None
+        self.capture_thread = None
+        
         self.status_label.setText("Capture completed - Processing anomalies...")
         self.log("Capture completed, processing anomalies...")
         
@@ -1101,7 +1130,7 @@ class RobotVision3DApp(QMainWindow):
         
     def trigger_anomaly_processing(self):
         """Trigger anomaly accumulation processing after delay"""
-        if self.infer_worker:
+        if self.infer_worker is not None:
             # Log current state
             if hasattr(self.infer_worker, 'accumulated_anomaly_maps'):
                 self.log(f"Triggering anomaly processing with {len(self.infer_worker.accumulated_anomaly_maps)} accumulated frames")
@@ -1122,6 +1151,10 @@ class RobotVision3DApp(QMainWindow):
         self.stop_capture_btn.setEnabled(False)
         self.status_label.setText("Ready")
         self.log("Inference processing finished")
+        
+        # Clean up references
+        self.infer_worker = None
+        self.infer_thread = None
     
     def log(self, message):
         """Add message to log"""
@@ -1137,13 +1170,15 @@ class RobotVision3DApp(QMainWindow):
                 self.stop_capture()
                 
             # Wait for threads to finish
-            if hasattr(self, 'capture_thread') and self.capture_thread.isRunning():
-                self.capture_thread.quit()
-                self.capture_thread.wait(2000)
+            if hasattr(self, 'capture_thread') and self.capture_thread is not None:
+                if self.capture_thread.isRunning():
+                    self.capture_thread.quit()
+                    self.capture_thread.wait(2000)
                 
-            if hasattr(self, 'infer_thread') and self.infer_thread.isRunning():
-                self.infer_thread.quit()
-                self.infer_thread.wait(2000)
+            if hasattr(self, 'infer_thread') and self.infer_thread is not None:
+                if self.infer_thread.isRunning():
+                    self.infer_thread.quit()
+                    self.infer_thread.wait(2000)
                 
             # Close PyVista plotters
             if hasattr(self, 'normal_viewer') and self.normal_viewer.plotter:
