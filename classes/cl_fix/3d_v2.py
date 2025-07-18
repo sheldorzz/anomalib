@@ -694,7 +694,7 @@ class RobotVision3DApp(QMainWindow):
         self.setGeometry(100, 100, 1600, 900)
         self.setMinimumSize(1400, 800)
         
-        # Workers and threads - Initialize to None
+        # Workers and threads
         self.capture_worker = None
         self.capture_thread = None
         self.infer_worker = None
@@ -856,38 +856,6 @@ class RobotVision3DApp(QMainWindow):
             self.model_label.setText(f"Loaded: {Path(filename).name}")
             self.log(f"Loaded model: {filename}")
     
-    def cleanup_existing_threads(self):
-        """Properly clean up existing threads with timeout"""
-        # Clean up capture thread
-        if self.capture_thread is not None:
-            if self.capture_thread.isRunning():
-                self.log("Cleaning up existing capture thread...")
-                if self.capture_worker is not None:
-                    self.capture_worker.stop_capture()
-                self.capture_thread.quit()
-                if not self.capture_thread.wait(5000):  # 5 second timeout
-                    logger.warning("Capture thread did not finish cleanly, terminating...")
-                    self.capture_thread.terminate()
-                    self.capture_thread.wait(2000)
-            self.capture_thread.deleteLater()
-            self.capture_thread = None
-            self.capture_worker = None
-            
-        # Clean up inference thread  
-        if self.infer_thread is not None:
-            if self.infer_thread.isRunning():
-                self.log("Cleaning up existing inference thread...")
-                if self.infer_worker is not None:
-                    self.infer_worker.stop_inference()
-                self.infer_thread.quit()
-                if not self.infer_thread.wait(5000):  # 5 second timeout
-                    logger.warning("Inference thread did not finish cleanly, terminating...")
-                    self.infer_thread.terminate()
-                    self.infer_thread.wait(2000)
-            self.infer_thread.deleteLater()
-            self.infer_thread = None
-            self.infer_worker = None
-    
     def start_capture(self):
         """Start capture and inference"""
         if not self.waypoints_config:
@@ -899,9 +867,6 @@ class RobotVision3DApp(QMainWindow):
             return
         
         try:
-            # Clean up any existing threads first
-            self.cleanup_existing_threads()
-            
             # Reset state
             self.is_capturing = True
             self.capture_complete = False
@@ -976,23 +941,34 @@ class RobotVision3DApp(QMainWindow):
             self.log(f"Error stopping capture: {e}")
     
     def setup_capture_worker(self):
-        """Setup capture worker and thread with proper cleanup"""
+        """Setup capture worker and thread"""
+        # Clean up any existing threads
+        if hasattr(self, 'capture_thread') and self.capture_thread is not None:
+            if self.capture_thread.isRunning():
+                self.capture_thread.quit()
+                self.capture_thread.wait()
+            
         self.capture_thread = QThread()
         self.capture_worker = CaptureWorker(self.waypoints_config)
         self.capture_worker.moveToThread(self.capture_thread)
         
-        # Connect signals - FIXED ORDER: cleanup connections after UI updates
+        # Connect signals
         self.capture_thread.started.connect(self.capture_worker.start_capture)
         self.capture_worker.progress.connect(self.progress_bar.setValue)
         self.capture_worker.error.connect(self.log)
         self.capture_worker.live_frame.connect(self.process_live_frame)
-        self.capture_worker.finished.connect(self.on_capture_finished)
-        
-        # Thread cleanup - connect to separate cleanup method
-        self.capture_worker.finished.connect(self.cleanup_capture_thread)
+        self.capture_worker.finished.connect(self.on_capture_finished)  # Call this first
+        self.capture_worker.finished.connect(self.capture_thread.quit)  # Then quit thread
+        self.capture_thread.finished.connect(self.capture_thread.deleteLater)
         
     def setup_inference_worker(self):
-        """Setup inference worker and thread with proper cleanup"""
+        """Setup inference worker and thread"""
+        # Clean up any existing threads
+        if hasattr(self, 'infer_thread') and self.infer_thread is not None:
+            if self.infer_thread.isRunning():
+                self.infer_thread.quit()
+                self.infer_thread.wait()
+            
         self.infer_thread = QThread()
         self.infer_worker = InferWorker(self.model_path)
         self.infer_worker.moveToThread(self.infer_thread)
@@ -1008,35 +984,14 @@ class RobotVision3DApp(QMainWindow):
         }
         self.infer_worker.set_volume_of_interest(hardcoded_voi)
         
-        # Connect signals - FIXED ORDER: cleanup connections after UI updates
+        # Connect signals
         self.infer_thread.started.connect(self.infer_worker.start_inference)
         self.infer_worker.error.connect(self.log)
         self.infer_worker.live_inference_result.connect(self.update_3d_visualization)
         self.infer_worker.anomaly_accumulation_complete.connect(self.on_anomaly_accumulation_complete)
+        self.infer_worker.finished.connect(self.infer_thread.quit)
         self.infer_worker.finished.connect(self.on_inference_finished)
-        
-        # Thread cleanup - connect to separate cleanup method
-        self.infer_worker.finished.connect(self.cleanup_inference_thread)
-    
-    def cleanup_capture_thread(self):
-        """Clean up capture thread safely"""
-        QTimer.singleShot(100, self._cleanup_capture_thread_delayed)
-        
-    def _cleanup_capture_thread_delayed(self):
-        """Delayed capture thread cleanup"""
-        if self.capture_thread is not None:
-            self.capture_thread.quit()
-            # Don't set references to None here, do it in finished handler
-            
-    def cleanup_inference_thread(self):
-        """Clean up inference thread safely"""
-        QTimer.singleShot(100, self._cleanup_inference_thread_delayed)
-        
-    def _cleanup_inference_thread_delayed(self):
-        """Delayed inference thread cleanup"""
-        if self.infer_thread is not None:
-            self.infer_thread.quit()
-            # Don't set references to None here, do it in finished handler
+        self.infer_thread.finished.connect(self.infer_thread.deleteLater)
     
     @Slot(object)
     def process_live_frame(self, frame_data):
@@ -1163,6 +1118,10 @@ class RobotVision3DApp(QMainWindow):
         self.capture_complete = True
         self.is_capturing = False
         
+        # Clean up capture references
+        self.capture_worker = None
+        self.capture_thread = None
+        
         self.status_label.setText("Capture completed - Processing anomalies...")
         self.log("Capture completed, processing anomalies...")
         
@@ -1187,34 +1146,15 @@ class RobotVision3DApp(QMainWindow):
             self.status_label.setText("Capture completed")
     
     def on_inference_finished(self):
-        """Handle inference worker finished - called after UI updates"""
+        """Handle inference worker finished"""
         self.start_capture_btn.setEnabled(True)
         self.stop_capture_btn.setEnabled(False)
         self.status_label.setText("Ready")
         self.log("Inference processing finished")
         
-        # Clean up references after a delay to allow thread to fully finish
-        QTimer.singleShot(200, self.clear_inference_references)
-        
-    def clear_inference_references(self):
-        """Clear inference worker/thread references after delay"""
-        if self.infer_thread is not None:
-            # Wait for thread to finish if still running
-            if self.infer_thread.isRunning():
-                self.infer_thread.wait(2000)
-            self.infer_thread.deleteLater()
-            self.infer_thread = None
-            
+        # Clean up references
         self.infer_worker = None
-        
-        # Also clear capture references if not already done
-        if self.capture_thread is not None:
-            if self.capture_thread.isRunning():
-                self.capture_thread.wait(2000)
-            self.capture_thread.deleteLater()
-            self.capture_thread = None
-            
-        self.capture_worker = None
+        self.infer_thread = None
     
     def log(self, message):
         """Add message to log"""
@@ -1228,9 +1168,17 @@ class RobotVision3DApp(QMainWindow):
             # Stop any running captures
             if self.is_capturing:
                 self.stop_capture()
-            
-            # Proper cleanup with timeouts
-            self.cleanup_existing_threads()
+                
+            # Wait for threads to finish
+            if hasattr(self, 'capture_thread') and self.capture_thread is not None:
+                if self.capture_thread.isRunning():
+                    self.capture_thread.quit()
+                    self.capture_thread.wait(2000)
+                
+            if hasattr(self, 'infer_thread') and self.infer_thread is not None:
+                if self.infer_thread.isRunning():
+                    self.infer_thread.quit()
+                    self.infer_thread.wait(2000)
                 
             # Close PyVista plotters
             if hasattr(self, 'normal_viewer') and self.normal_viewer.plotter:
