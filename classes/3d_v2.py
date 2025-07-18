@@ -4,6 +4,7 @@ import cv2
 from pathlib import Path
 import json
 import logging
+import traceback
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 import matplotlib.cm as cm
@@ -452,6 +453,9 @@ class PyVistaViewer(QWidget):
     
     def add_bounding_boxes(self, bounding_boxes):
         """Add 3D bounding boxes to the visualization"""
+        # Save camera position
+        self.save_camera_position()
+        
         self.clear_bounding_boxes()
         
         for i, bbox in enumerate(bounding_boxes):
@@ -469,43 +473,109 @@ class PyVistaViewer(QWidget):
                 # Color based on anomaly score
                 color = 'red' if bbox['mean_score'] > 0.9 else 'orange'
                 
+                # Store the box for re-rendering after voxelization
+                bbox['box_mesh'] = box
+                bbox['color'] = color
+                
                 self.plotter.add_mesh(
                     box, style='wireframe', color=color, 
-                    line_width=3, opacity=0.8, name=f"bbox_{i}"
+                    line_width=3, opacity=0.8, name=f"bbox_{i}",
+                    render_points_as_spheres=False
                 )
                 
                 self.bounding_boxes.append(bbox)
                 
             except Exception as e:
                 logger.error(f"Failed to add bounding box {i}: {e}")
+        
+        # Restore camera position
+        self.restore_camera_position()
+        
+        # Force render
+        self.plotter.render()
+        
+        logger.info(f"Added {len(self.bounding_boxes)} bounding boxes to {self.title}")
     
     def voxelize_point_cloud(self):
         """Convert point cloud to voxel representation"""
         if self.current_cloud.n_points == 0:
+            logger.warning("No points to voxelize")
             return
             
         try:
             # Save camera position
             self.save_camera_position()
             
+            logger.info(f"Voxelizing {self.current_cloud.n_points} points with voxel size {self.voxel_size}m")
+            
             # Create voxel grid
             voxel_grid = pv.voxelize(self.current_cloud, cell_size=self.voxel_size)
             
+            logger.info(f"Created voxel grid with {voxel_grid.n_cells} voxels")
+            
             # Update visualization
             self.plotter.remove_actor("point_cloud", render=False)
-            self.plotter.add_mesh(
-                voxel_grid, scalars="RGB", rgb=True, 
-                opacity=0.8, name="point_cloud"
-            )
+            
+            # Check if voxel grid has RGB data
+            has_rgb = False
+            if "RGB" in voxel_grid.point_data:
+                has_rgb = True
+                logger.info("Voxel grid has RGB data")
+            elif "RGB" in voxel_grid.cell_data:
+                has_rgb = True
+                logger.info("Voxel grid has RGB cell data")
+                # Move cell data to point data for visualization
+                voxel_grid = voxel_grid.cell_data_to_point_data()
+            
+            if has_rgb:
+                try:
+                    self.plotter.add_mesh(
+                        voxel_grid, scalars="RGB", rgb=True, 
+                        opacity=0.8, name="point_cloud"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to render with RGB: {e}")
+                    # Fallback to no RGB
+                    self.plotter.add_mesh(
+                        voxel_grid, opacity=0.8, name="point_cloud", color='gray'
+                    )
+            else:
+                logger.info("No RGB data in voxel grid, using default color")
+                self.plotter.add_mesh(
+                    voxel_grid, opacity=0.8, name="point_cloud", color='gray'
+                )
             
             self.is_voxelized = True
             self.info_label.setText(f"Voxels: {voxel_grid.n_cells:,}")
             
+            # Re-add bounding boxes on top of voxels
+            if self.bounding_boxes:
+                logger.info(f"Re-rendering {len(self.bounding_boxes)} bounding boxes")
+                for i, bbox in enumerate(self.bounding_boxes):
+                    # Re-add the bounding box mesh
+                    if 'box_mesh' in bbox and 'color' in bbox:
+                        try:
+                            self.plotter.add_mesh(
+                                bbox['box_mesh'], style='wireframe', color=bbox['color'], 
+                                line_width=3, opacity=0.8, name=f"bbox_{i}",
+                                render_points_as_spheres=False
+                            )
+                        except Exception as e:
+                            logger.error(f"Failed to re-add bounding box {i}: {e}")
+            
             # Restore camera position
             self.restore_camera_position()
             
+            # Force final render
+            self.plotter.render()
+            
+            logger.info("Voxelization complete")
+            
         except Exception as e:
             logger.error(f"Failed to voxelize: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            self.info_label.setText(f"Voxelize error: {str(e)[:50]}")
     
     def toggle_grid(self):
         """Toggle grid visibility"""
@@ -800,6 +870,12 @@ class RobotVision3DApp(QMainWindow):
             # Reset state
             self.is_capturing = True
             self.capture_complete = False
+            self._waypoint_count = 0  # Reset waypoint counter
+            
+            # Clear existing point clouds
+            self.normal_viewer.clear_point_cloud()
+            self.anomaly_viewer.clear_point_cloud()
+            self.log("Cleared existing point clouds")
             
             # Setup inference worker first
             self.setup_inference_worker()
@@ -807,11 +883,14 @@ class RobotVision3DApp(QMainWindow):
             # Setup capture worker
             self.setup_capture_worker()
             
+            # Verify signal connections
+            self.log("Signal connections established")
+            
             # Start inference worker
             self.infer_thread.start()
             
-            # Start capture worker
-            self.capture_thread.start()
+            # Wait for inference to be ready
+            QTimer.singleShot(500, lambda: self.capture_thread.start())
             
             # Update UI
             self.start_capture_btn.setEnabled(False)
@@ -830,19 +909,23 @@ class RobotVision3DApp(QMainWindow):
             
             if self.capture_worker:
                 self.capture_worker.stop_capture()
-            if self.infer_worker:
-                self.infer_worker.stop_inference()
-                
-            self.start_capture_btn.setEnabled(True)
-            self.stop_capture_btn.setEnabled(False)
-            self.status_label.setText("Stopped")
-            self.log("Stopped capture and inference")
+            
+            # Don't stop inference here - let it finish processing
+            # It will be stopped when capture finishes
+            
+            self.status_label.setText("Stopping...")
+            self.log("Stopping capture...")
             
         except Exception as e:
             self.log(f"Error stopping capture: {e}")
     
     def setup_capture_worker(self):
         """Setup capture worker and thread"""
+        # Clean up any existing threads
+        if hasattr(self, 'capture_thread') and self.capture_thread.isRunning():
+            self.capture_thread.quit()
+            self.capture_thread.wait()
+            
         self.capture_thread = QThread()
         self.capture_worker = CaptureWorker(self.waypoints_config)
         self.capture_worker.moveToThread(self.capture_thread)
@@ -852,11 +935,17 @@ class RobotVision3DApp(QMainWindow):
         self.capture_worker.progress.connect(self.progress_bar.setValue)
         self.capture_worker.error.connect(self.log)
         self.capture_worker.live_frame.connect(self.process_live_frame)
-        self.capture_worker.finished.connect(self.capture_thread.quit)
-        self.capture_worker.finished.connect(self.on_capture_finished)
+        self.capture_worker.finished.connect(self.on_capture_finished)  # Call this first
+        self.capture_worker.finished.connect(self.capture_thread.quit)  # Then quit thread
+        self.capture_thread.finished.connect(self.capture_thread.deleteLater)
         
     def setup_inference_worker(self):
         """Setup inference worker and thread"""
+        # Clean up any existing threads
+        if hasattr(self, 'infer_thread') and self.infer_thread.isRunning():
+            self.infer_thread.quit()
+            self.infer_thread.wait()
+            
         self.infer_thread = QThread()
         self.infer_worker = InferWorker(self.model_path)
         self.infer_worker.moveToThread(self.infer_thread)
@@ -878,6 +967,8 @@ class RobotVision3DApp(QMainWindow):
         self.infer_worker.live_inference_result.connect(self.update_3d_visualization)
         self.infer_worker.anomaly_accumulation_complete.connect(self.on_anomaly_accumulation_complete)
         self.infer_worker.finished.connect(self.infer_thread.quit)
+        self.infer_worker.finished.connect(self.on_inference_finished)
+        self.infer_thread.finished.connect(self.infer_thread.deleteLater)
     
     @Slot(object)
     def process_live_frame(self, frame_data):
@@ -887,8 +978,10 @@ class RobotVision3DApp(QMainWindow):
             self.rgb_widget.update_image(frame_data['rgb'])
         
         # Forward to inference worker
-        if self.infer_worker:
+        if self.infer_worker and hasattr(self.infer_worker, '_running') and self.infer_worker._running:
             self.infer_worker.process_live_frame(frame_data)
+        else:
+            logger.warning("Inference worker not ready to process frame")
     
     @Slot(object)
     def update_3d_visualization(self, inference_result):
@@ -921,19 +1014,24 @@ class RobotVision3DApp(QMainWindow):
             
             # Check if point clouds are valid
             if normal_cloud.n_points == 0:
-                self.log("Warning: Empty normal point cloud generated")
+                logger.warning("Empty normal point cloud generated")
                 return
                 
             # Add to viewers
             self.normal_viewer.add_point_cloud(normal_cloud)
             self.anomaly_viewer.add_point_cloud(anomaly_cloud)
             
-            # Log progress
+            # Log progress every 10 waypoints
             waypoint_id = frame_data.get("waypoint_id", "unknown")
-            normal_total = self.normal_viewer.point_count
-            anomaly_total = self.anomaly_viewer.point_count
-            
-            self.log(f"Added {waypoint_id}: Normal={normal_total:,} pts, Anomaly={anomaly_total:,} pts")
+            if hasattr(self, '_waypoint_count'):
+                self._waypoint_count += 1
+            else:
+                self._waypoint_count = 1
+                
+            if self._waypoint_count % 10 == 0:
+                normal_total = self.normal_viewer.point_count
+                anomaly_total = self.anomaly_viewer.point_count
+                self.log(f"Progress: {self._waypoint_count} waypoints, Normal={normal_total:,} pts, Anomaly={anomaly_total:,} pts")
             
             # Log anomaly detection
             if has_anomaly:
@@ -949,39 +1047,81 @@ class RobotVision3DApp(QMainWindow):
     def on_anomaly_accumulation_complete(self, result):
         """Handle completed anomaly accumulation and bounding box computation"""
         try:
-            bounding_boxes = result['bounding_boxes']
+            self.log("Anomaly accumulation complete signal received")
+            
+            bounding_boxes = result.get('bounding_boxes', [])
             
             self.log(f"Anomaly processing complete: {len(bounding_boxes)} regions detected")
             
-            # Add bounding boxes to viewers
-            self.normal_viewer.add_bounding_boxes(bounding_boxes)
-            self.anomaly_viewer.add_bounding_boxes(bounding_boxes)
+            if len(bounding_boxes) > 0:
+                # Add bounding boxes to viewers
+                self.normal_viewer.add_bounding_boxes(bounding_boxes)
+                self.anomaly_viewer.add_bounding_boxes(bounding_boxes)
+                
+                # Log RGB image associations
+                for i, bbox in enumerate(bounding_boxes):
+                    if bbox.get('best_view'):
+                        self.log(f"BBox {i}: Best view from {bbox['best_view']} (score: {bbox['max_score']:.3f})")
+            else:
+                self.log("No anomalies detected within VOI thresholds")
             
-            # Log RGB image associations
-            for i, bbox in enumerate(bounding_boxes):
-                if bbox.get('best_view'):
-                    self.log(f"BBox {i}: Best view from {bbox['best_view']} (score: {bbox['max_score']:.3f})")
+            # Always voxelize point clouds after processing
+            self.log("Starting voxelization...")
             
-            # Voxelize point clouds
-            self.log("Voxelizing point clouds...")
-            self.normal_viewer.voxelize_point_cloud()
-            self.anomaly_viewer.voxelize_point_cloud()
+            # Check if we have point clouds to voxelize
+            if self.normal_viewer.current_cloud.n_points > 0:
+                self.log(f"Voxelizing normal view ({self.normal_viewer.current_cloud.n_points} points)")
+                self.normal_viewer.voxelize_point_cloud()
+            else:
+                self.log("Warning: No points in normal viewer to voxelize")
+                
+            if self.anomaly_viewer.current_cloud.n_points > 0:
+                self.log(f"Voxelizing anomaly view ({self.anomaly_viewer.current_cloud.n_points} points)")
+                self.anomaly_viewer.voxelize_point_cloud()
+            else:
+                self.log("Warning: No points in anomaly viewer to voxelize")
             
+            self.status_label.setText("Post-processing complete")
             self.log("Post-processing complete")
             
         except Exception as e:
             self.log(f"Error in post-processing: {e}")
-            logger.error(traceback.format_exc())
+            logger.error(f"Anomaly accumulation error: {traceback.format_exc()}")
     
     def on_capture_finished(self):
         """Handle capture finished"""
         self.capture_complete = True
         self.is_capturing = False
         
+        self.status_label.setText("Capture completed - Processing anomalies...")
+        self.log("Capture completed, processing anomalies...")
+        
+        # Add a small delay to ensure all frames are processed
+        QTimer.singleShot(1000, self.trigger_anomaly_processing)
+        
+    def trigger_anomaly_processing(self):
+        """Trigger anomaly accumulation processing after delay"""
+        if self.infer_worker:
+            # Log current state
+            if hasattr(self.infer_worker, 'accumulated_anomaly_maps'):
+                self.log(f"Triggering anomaly processing with {len(self.infer_worker.accumulated_anomaly_maps)} accumulated frames")
+            else:
+                self.log("Triggering anomaly processing...")
+                
+            # Stop inference which will trigger accumulated anomaly processing
+            self.infer_worker.stop_inference()
+        else:
+            # If no inference worker, just update UI
+            self.start_capture_btn.setEnabled(True)
+            self.stop_capture_btn.setEnabled(False)
+            self.status_label.setText("Capture completed")
+    
+    def on_inference_finished(self):
+        """Handle inference worker finished"""
         self.start_capture_btn.setEnabled(True)
         self.stop_capture_btn.setEnabled(False)
-        self.status_label.setText("Capture completed - Processing...")
-        self.log("Capture completed, processing anomalies...")
+        self.status_label.setText("Ready")
+        self.log("Inference processing finished")
     
     def log(self, message):
         """Add message to log"""
@@ -995,6 +1135,15 @@ class RobotVision3DApp(QMainWindow):
             # Stop any running captures
             if self.is_capturing:
                 self.stop_capture()
+                
+            # Wait for threads to finish
+            if hasattr(self, 'capture_thread') and self.capture_thread.isRunning():
+                self.capture_thread.quit()
+                self.capture_thread.wait(2000)
+                
+            if hasattr(self, 'infer_thread') and self.infer_thread.isRunning():
+                self.infer_thread.quit()
+                self.infer_thread.wait(2000)
                 
             # Close PyVista plotters
             if hasattr(self, 'normal_viewer') and self.normal_viewer.plotter:

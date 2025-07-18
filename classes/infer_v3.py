@@ -100,6 +100,7 @@ class InferWorker(QObject):
             self.global_min_anomaly = float('inf')
             self.global_max_anomaly = float('-inf')
             
+            logger.info("Inference worker ready and accumulation reset")
             self.ready.emit()
         except Exception as exc:
             self.error.emit(str(exc))
@@ -107,10 +108,22 @@ class InferWorker(QObject):
 
     def stop_inference(self):
         self._running = False
+        logger.info(f"Stopping inference. Accumulated maps: {len(self.accumulated_anomaly_maps)}")
         
         # Process accumulated data before finishing
         if self.accumulated_anomaly_maps:
             self.process_accumulated_anomalies()
+        else:
+            logger.warning("No accumulated anomaly maps to process")
+            # Still emit result to trigger voxelization
+            result = {
+                'bounding_boxes': [],
+                'anomaly_points': np.array([]),
+                'anomaly_scores': np.array([]),
+                'global_min': self.global_min_anomaly,
+                'global_max': self.global_max_anomaly
+            }
+            self.anomaly_accumulation_complete.emit(result)
             
         self.finished.emit()
 
@@ -197,6 +210,10 @@ class InferWorker(QObject):
             })
             self.accumulated_frame_data.append(frame_data.copy())
             
+            # Log accumulation progress every 10 frames
+            if len(self.accumulated_anomaly_maps) % 10 == 0:
+                logger.info(f"Accumulated {len(self.accumulated_anomaly_maps)} anomaly maps")
+            
             # Normalize using current global values
             normalized_map = self.normalize_accumulated_anomaly_map(anomaly_map)
             
@@ -236,10 +253,20 @@ class InferWorker(QObject):
     def process_accumulated_anomalies(self):
         """Process all accumulated anomaly data to compute 3D bounding boxes"""
         if not self.accumulated_anomaly_maps:
+            logger.info("No accumulated anomaly maps to process")
+            # Still emit empty result to trigger voxelization
+            result = {
+                'bounding_boxes': [],
+                'anomaly_points': np.array([]),
+                'anomaly_scores': np.array([]),
+                'global_min': self.global_min_anomaly,
+                'global_max': self.global_max_anomaly
+            }
+            self.anomaly_accumulation_complete.emit(result)
             return
             
         try:
-            logger.info("Processing accumulated anomalies for 3D bounding boxes...")
+            logger.info(f"Processing {len(self.accumulated_anomaly_maps)} accumulated anomaly maps...")
             
             # Prepare 3D anomaly volume
             all_anomaly_points = []
@@ -296,6 +323,15 @@ class InferWorker(QObject):
             
             if not all_anomaly_points:
                 logger.info("No anomaly points found within VOI")
+                # Still emit result to trigger voxelization
+                result = {
+                    'bounding_boxes': [],
+                    'anomaly_points': np.array([]),
+                    'anomaly_scores': np.array([]),
+                    'global_min': self.global_min_anomaly,
+                    'global_max': self.global_max_anomaly
+                }
+                self.anomaly_accumulation_complete.emit(result)
                 return
                 
             # Convert to numpy array
@@ -322,6 +358,16 @@ class InferWorker(QObject):
         except Exception as e:
             self.error.emit(f"Error processing accumulated anomalies: {str(e)}")
             logger.error(traceback.format_exc())
+            
+            # Still emit empty result to trigger voxelization
+            result = {
+                'bounding_boxes': [],
+                'anomaly_points': np.array([]),
+                'anomaly_scores': np.array([]),
+                'global_min': self.global_min_anomaly,
+                'global_max': self.global_max_anomaly
+            }
+            self.anomaly_accumulation_complete.emit(result)
 
     def compute_3d_bounding_boxes(self, points, scores, associated_images):
         """Compute 3D bounding boxes from anomaly points"""
