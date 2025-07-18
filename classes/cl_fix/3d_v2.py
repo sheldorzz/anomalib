@@ -4,10 +4,8 @@ import cv2
 from pathlib import Path
 import json
 import logging
-import traceback
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 from datetime import datetime
-import matplotlib.cm as cm
 
 # PyVista for 3D visualization - Install with: pip install pyvista pyvistaqt
 try:
@@ -22,7 +20,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, 
     QPushButton, QLabel, QProgressBar, QTextEdit, QGroupBox,
     QSlider, QSpinBox, QCheckBox, QGridLayout,
-    QFileDialog, QMessageBox, QSplitter, QSizePolicy
+    QFileDialog, QMessageBox, QSplitter, QSizePolicy, QDoubleSpinBox
 )
 from PySide6.QtCore import Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QFont, QPixmap, QImage
@@ -31,6 +29,14 @@ from PySide6.QtGui import QFont, QPixmap, QImage
 from capture_core import CaptureWorker
 from infer_core import InferWorker
 from train_core import TrainWorker
+
+# Try to import sklearn for clustering
+try:
+    from sklearn.cluster import DBSCAN
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
+    print("Warning: sklearn not installed. Anomaly region clustering will be limited.")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -43,14 +49,6 @@ class PointCloudGenerator:
     def __init__(self):
         self.max_depth = 3.0  # Maximum depth in meters
         self.min_depth = 0.1  # Minimum depth in meters
-        self.anomaly_colormap = cm.get_cmap('jet')  # For anomaly heatmap
-        
-        # Hardcoded Volume of Interest (meters)
-        self.voi = {
-            'x_min': -1.0, 'x_max': 1.0,
-            'y_min': -1.0, 'y_max': 1.0,
-            'z_min': 0.1, 'z_max': 2.0
-        }
         
     def create_point_cloud(self, rgb_image, depth_image, camera_matrix, transform_matrix=None):
         """
@@ -98,22 +96,12 @@ class PointCloudGenerator:
             points_transformed = (transform_matrix @ points_homo.T).T
             points_3d = points_transformed[:, :3]
         
-        # Filter by Volume of Interest
-        voi_mask = (
-            (points_3d[:, 0] >= self.voi['x_min']) & (points_3d[:, 0] <= self.voi['x_max']) &
-            (points_3d[:, 1] >= self.voi['y_min']) & (points_3d[:, 1] <= self.voi['y_max']) &
-            (points_3d[:, 2] >= self.voi['z_min']) & (points_3d[:, 2] <= self.voi['z_max'])
-        )
-        
-        points_3d = points_3d[voi_mask]
-        
-        # Get RGB colors for filtered points
+        # Get RGB colors
         if rgb_image.shape[2] == 3:
             rgb = cv2.cvtColor(rgb_image, cv2.COLOR_BGR2RGB)
         else:
             rgb = rgb_image
         rgb_valid = rgb[valid_depth]
-        rgb_valid = rgb_valid[voi_mask]
         
         # Create PyVista point cloud
         if len(points_3d) > 0:
@@ -123,8 +111,8 @@ class PointCloudGenerator:
         else:
             return pv.PolyData()
     
-    def create_anomaly_point_cloud_heatmap(self, rgb_image, depth_image, camera_matrix, 
-                                          anomaly_map, transform_matrix=None):
+    def create_anomaly_point_cloud(self, rgb_image, depth_image, camera_matrix, 
+                                   anomaly_map, transform_matrix=None, threshold=None):
         """
         Create point cloud with full anomaly heatmap visualization
         
@@ -132,11 +120,12 @@ class PointCloudGenerator:
             rgb_image: RGB image (H, W, 3)
             depth_image: Depth image in meters (H, W)
             camera_matrix: 3x3 camera intrinsic matrix
-            anomaly_map: Normalized anomaly scores (0-1)
+            anomaly_map: Normalized anomaly map (0-1) - NOT binary mask
             transform_matrix: 4x4 transformation matrix (optional)
+            threshold: Optional threshold for filtering (if None, show all points)
             
         Returns:
-            PyVista PolyData point cloud with anomaly heatmap colors
+            PyVista PolyData point cloud with anomaly heatmap
         """
         height, width = depth_image.shape
         
@@ -145,7 +134,7 @@ class PointCloudGenerator:
             anomaly_map_resized = cv2.resize(
                 anomaly_map.astype(np.float32), 
                 (width, height), 
-                interpolation=cv2.INTER_LINEAR
+                interpolation=cv2.INTER_LINEAR  # Use linear for smooth interpolation
             )
         else:
             anomaly_map_resized = anomaly_map.astype(np.float32)
@@ -160,11 +149,15 @@ class PointCloudGenerator:
         # Filter valid depth points
         valid_depth = (depth_image > self.min_depth) & (depth_image < self.max_depth)
         
+        # Optional: filter by anomaly threshold
+        if threshold is not None:
+            valid_depth = valid_depth & (anomaly_map_resized > threshold)
+        
         # Get valid coordinates
         u_valid = u[valid_depth]
         v_valid = v[valid_depth]
         z_valid = depth_image[valid_depth]
-        anomaly_valid = anomaly_map_resized[valid_depth]
+        anomaly_scores = anomaly_map_resized[valid_depth]
         
         # Convert to 3D points (camera coordinates)
         x_3d = (u_valid - cx) * z_valid / fx
@@ -182,46 +175,30 @@ class PointCloudGenerator:
             points_transformed = (transform_matrix @ points_homo.T).T
             points_3d = points_transformed[:, :3]
         
-        # Filter by Volume of Interest
-        voi_mask = (
-            (points_3d[:, 0] >= self.voi['x_min']) & (points_3d[:, 0] <= self.voi['x_max']) &
-            (points_3d[:, 1] >= self.voi['y_min']) & (points_3d[:, 1] <= self.voi['y_max']) &
-            (points_3d[:, 2] >= self.voi['z_min']) & (points_3d[:, 2] <= self.voi['z_max'])
-        )
-        
-        points_3d = points_3d[voi_mask]
-        anomaly_valid = anomaly_valid[voi_mask]
-        
         # Create PyVista point cloud
         if len(points_3d) > 0:
             cloud = pv.PolyData(points_3d)
             
-            # Apply colormap to anomaly scores
-            # Ensure anomaly scores are in [0, 1] range
-            anomaly_clipped = np.clip(anomaly_valid, 0, 1)
+            # Create color map based on anomaly scores
+            # Use matplotlib colormap for better visualization
+            import matplotlib.pyplot as plt
+            import matplotlib.cm as cm
             
-            # Get colors from colormap (returns RGBA, we need RGB)
-            colors_rgba = self.anomaly_colormap(anomaly_clipped)
-            colors_rgb = (colors_rgba[:, :3] * 255).astype(np.uint8)
+            # Use 'jet' colormap: blue (low) -> red (high)
+            cmap = cm.get_cmap('jet')
+            colors = cmap(anomaly_scores)[:, :3]  # Get RGB, ignore alpha
+            colors = (colors * 255).astype(np.uint8)
             
-            cloud["RGB"] = colors_rgb
-            cloud["Anomaly_Score"] = anomaly_valid
+            cloud["RGB"] = colors
+            cloud["Anomaly_Score"] = anomaly_scores
             
             return cloud
         else:
             return pv.PolyData()
-    
-    def create_anomaly_point_cloud(self, rgb_image, depth_image, camera_matrix, 
-                                   anomaly_mask, transform_matrix=None):
-        """Original method for binary anomaly visualization (kept for compatibility)"""
-        return self.create_anomaly_point_cloud_heatmap(
-            rgb_image, depth_image, camera_matrix, 
-            anomaly_mask.astype(np.float32), transform_matrix
-        )
 
 
 class PyVistaViewer(QWidget):
-    """PyVista-based 3D viewer widget with view persistence"""
+    """PyVista-based 3D viewer widget"""
     
     def __init__(self, title="3D View"):
         super().__init__()
@@ -231,9 +208,6 @@ class PyVistaViewer(QWidget):
         self.grid_size = 2.0  # 2m grid
         self.show_grid = True
         self.point_count = 0
-        self.camera_position = None  # Store camera position
-        self.bounding_boxes = []  # Store bounding box actors
-        self.is_voxelized = False
         self.setup_ui()
         
     def setup_ui(self):
@@ -283,7 +257,7 @@ class PyVistaViewer(QWidget):
             # Add coordinate axes at origin
             self.plotter.add_axes_at_origin(labels_off=False)
             
-            # Create grid planes matching VOI size
+            # Create grid planes
             # XY plane (Z=0)
             xy_grid = pv.Plane(center=(0, 0, 0), direction=(0, 0, 1), 
                               i_size=self.grid_size, j_size=self.grid_size,
@@ -293,14 +267,14 @@ class PyVistaViewer(QWidget):
             
             # XZ plane (Y=0)
             xz_grid = pv.Plane(center=(0, 0, 0), direction=(0, 1, 0),
-                              i_size=self.grid_size, j_size=2.0,  # Z range is 0.1 to 2.0
+                              i_size=self.grid_size, j_size=self.grid_size,
                               i_resolution=20, j_resolution=20)
             self.plotter.add_mesh(xz_grid, style='wireframe', color='lightblue',
                                 line_width=1, opacity=0.2, name="xz_grid")
             
             # YZ plane (X=0)
             yz_grid = pv.Plane(center=(0, 0, 0), direction=(1, 0, 0),
-                              i_size=self.grid_size, j_size=2.0,  # Z range is 0.1 to 2.0
+                              i_size=self.grid_size, j_size=self.grid_size,
                               i_resolution=20, j_resolution=20)
             self.plotter.add_mesh(yz_grid, style='wireframe', color='lightcoral',
                                 line_width=1, opacity=0.2, name="yz_grid")
@@ -366,24 +340,19 @@ class PyVistaViewer(QWidget):
                 logger.error(f"Both downsampling methods failed: {e2}")
                 return cloud  # Return original if all else fails
 
-    def save_camera_position(self):
-        """Save current camera position"""
-        if hasattr(self.plotter, 'camera_position'):
-            self.camera_position = self.plotter.camera_position
-
-    def restore_camera_position(self):
-        """Restore saved camera position"""
-        if self.camera_position is not None:
-            try:
-                self.plotter.camera_position = self.camera_position
-            except:
-                pass  # Ignore if restoration fails
-
-    def add_point_cloud(self, cloud, clear_previous=False):
-        """Add point cloud to visualization with view persistence"""
+    def add_point_cloud(self, cloud, clear_previous=False, maintain_view=True):
+        """Add point cloud to visualization
+        
+        Args:
+            cloud: PyVista point cloud
+            clear_previous: Whether to clear previous cloud
+            maintain_view: Whether to maintain camera position
+        """
         try:
-            # Save camera position before update
-            self.save_camera_position()
+            # Store camera position if maintaining view
+            camera_position = None
+            if maintain_view and hasattr(self.plotter, 'camera_position'):
+                camera_position = self.plotter.camera_position
             
             if clear_previous:
                 self.current_cloud = pv.PolyData()
@@ -409,12 +378,13 @@ class PyVistaViewer(QWidget):
                     self.plotter.add_mesh(self.current_cloud, point_size=3, name="point_cloud", 
                                         render_points_as_spheres=True)
                 
+                # Restore camera position if maintaining view
+                if maintain_view and camera_position is not None:
+                    self.plotter.camera_position = camera_position
+                
                 # Update info
                 self.point_count = self.current_cloud.n_points
                 self.info_label.setText(f"Points: {self.point_count:,}")
-                
-                # Restore camera position after update
-                self.restore_camera_position()
                 
         except Exception as e:
             logger.error(f"Failed to add point cloud: {e}")
@@ -425,157 +395,18 @@ class PyVistaViewer(QWidget):
         try:
             self.current_cloud = pv.PolyData()
             self.point_count = 0
-            self.is_voxelized = False
             
-            # Remove point cloud and bounding boxes
+            # Remove only point cloud, keep grid elements
             try:
                 self.plotter.remove_actor("point_cloud", render=False)
             except:
                 pass  # Actor might not exist
-                
-            # Clear bounding boxes
-            self.clear_bounding_boxes()
-            
             self.plotter.render()
+            
             self.info_label.setText("Cleared")
             
         except Exception as e:
             logger.error(f"Failed to clear point cloud: {e}")
-    
-    def clear_bounding_boxes(self):
-        """Clear all bounding boxes"""
-        for i in range(len(self.bounding_boxes)):
-            try:
-                self.plotter.remove_actor(f"bbox_{i}", render=False)
-            except:
-                pass
-        self.bounding_boxes.clear()
-    
-    def add_bounding_boxes(self, bounding_boxes):
-        """Add 3D bounding boxes to the visualization"""
-        # Save camera position
-        self.save_camera_position()
-        
-        self.clear_bounding_boxes()
-        
-        for i, bbox in enumerate(bounding_boxes):
-            try:
-                min_pt = np.array(bbox['min'])
-                max_pt = np.array(bbox['max'])
-                
-                # Create box mesh
-                box = pv.Box(bounds=[
-                    min_pt[0], max_pt[0],
-                    min_pt[1], max_pt[1],
-                    min_pt[2], max_pt[2]
-                ])
-                
-                # Color based on anomaly score
-                color = 'red' if bbox['mean_score'] > 0.9 else 'orange'
-                
-                # Store the box for re-rendering after voxelization
-                bbox['box_mesh'] = box
-                bbox['color'] = color
-                
-                self.plotter.add_mesh(
-                    box, style='wireframe', color=color, 
-                    line_width=3, opacity=0.8, name=f"bbox_{i}",
-                    render_points_as_spheres=False
-                )
-                
-                self.bounding_boxes.append(bbox)
-                
-            except Exception as e:
-                logger.error(f"Failed to add bounding box {i}: {e}")
-        
-        # Restore camera position
-        self.restore_camera_position()
-        
-        # Force render
-        self.plotter.render()
-        
-        logger.info(f"Added {len(self.bounding_boxes)} bounding boxes to {self.title}")
-    
-    def voxelize_point_cloud(self):
-        """Convert point cloud to voxel representation"""
-        if self.current_cloud.n_points == 0:
-            logger.warning("No points to voxelize")
-            return
-            
-        try:
-            # Save camera position
-            self.save_camera_position()
-            
-            logger.info(f"Voxelizing {self.current_cloud.n_points} points with voxel size {self.voxel_size}m")
-            
-            # Create voxel grid
-            voxel_grid = pv.voxelize(self.current_cloud, cell_size=self.voxel_size)
-            
-            logger.info(f"Created voxel grid with {voxel_grid.n_cells} voxels")
-            
-            # Update visualization
-            self.plotter.remove_actor("point_cloud", render=False)
-            
-            # Check if voxel grid has RGB data
-            has_rgb = False
-            if "RGB" in voxel_grid.point_data:
-                has_rgb = True
-                logger.info("Voxel grid has RGB data")
-            elif "RGB" in voxel_grid.cell_data:
-                has_rgb = True
-                logger.info("Voxel grid has RGB cell data")
-                # Move cell data to point data for visualization
-                voxel_grid = voxel_grid.cell_data_to_point_data()
-            
-            if has_rgb:
-                try:
-                    self.plotter.add_mesh(
-                        voxel_grid, scalars="RGB", rgb=True, 
-                        opacity=0.8, name="point_cloud"
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to render with RGB: {e}")
-                    # Fallback to no RGB
-                    self.plotter.add_mesh(
-                        voxel_grid, opacity=0.8, name="point_cloud", color='gray'
-                    )
-            else:
-                logger.info("No RGB data in voxel grid, using default color")
-                self.plotter.add_mesh(
-                    voxel_grid, opacity=0.8, name="point_cloud", color='gray'
-                )
-            
-            self.is_voxelized = True
-            self.info_label.setText(f"Voxels: {voxel_grid.n_cells:,}")
-            
-            # Re-add bounding boxes on top of voxels
-            if self.bounding_boxes:
-                logger.info(f"Re-rendering {len(self.bounding_boxes)} bounding boxes")
-                for i, bbox in enumerate(self.bounding_boxes):
-                    # Re-add the bounding box mesh
-                    if 'box_mesh' in bbox and 'color' in bbox:
-                        try:
-                            self.plotter.add_mesh(
-                                bbox['box_mesh'], style='wireframe', color=bbox['color'], 
-                                line_width=3, opacity=0.8, name=f"bbox_{i}",
-                                render_points_as_spheres=False
-                            )
-                        except Exception as e:
-                            logger.error(f"Failed to re-add bounding box {i}: {e}")
-            
-            # Restore camera position
-            self.restore_camera_position()
-            
-            # Force final render
-            self.plotter.render()
-            
-            logger.info("Voxelization complete")
-            
-        except Exception as e:
-            logger.error(f"Failed to voxelize: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            self.info_label.setText(f"Voxelize error: {str(e)[:50]}")
     
     def toggle_grid(self):
         """Toggle grid visibility"""
@@ -599,7 +430,6 @@ class PyVistaViewer(QWidget):
         """Reset camera view"""
         self.plotter.reset_camera()
         self.plotter.view_isometric()
-        self.camera_position = None
         
     def set_voxel_size(self, size_mm):
         """Set voxel size in millimeters"""
@@ -625,74 +455,14 @@ class PyVistaViewer(QWidget):
         logger.info(f"Grid size set to {size_m}m")
 
 
-class LiveRGBWidget(QWidget):
-    """Widget for displaying live RGB feed"""
-    
-    def __init__(self):
-        super().__init__()
-        self.setup_ui()
-        
-    def setup_ui(self):
-        layout = QVBoxLayout(self)
-        
-        # Title
-        title = QLabel("Live RGB Feed")
-        title.setAlignment(Qt.AlignCenter)
-        title.setFont(QFont("Arial", 12, QFont.Bold))
-        layout.addWidget(title)
-        
-        # Image display
-        self.image_label = QLabel()
-        self.image_label.setMinimumSize(640, 480)
-        self.image_label.setMaximumSize(640, 480)
-        self.image_label.setScaledContents(True)
-        self.image_label.setStyleSheet("border: 2px solid #333;")
-        self.image_label.setText("No feed")
-        self.image_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.image_label)
-        
-        # Info label
-        self.info_label = QLabel("Waiting for feed...")
-        self.info_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.info_label)
-        
-    def update_image(self, bgr_image):
-        """Update displayed image"""
-        try:
-            # Convert BGR to RGB
-            rgb_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
-            
-            # Resize if needed
-            height, width, channel = rgb_image.shape
-            if width > 640 or height > 480:
-                scale = min(640/width, 480/height)
-                new_width = int(width * scale)
-                new_height = int(height * scale)
-                rgb_image = cv2.resize(rgb_image, (new_width, new_height))
-            
-            # Convert to QImage
-            height, width, channel = rgb_image.shape
-            bytes_per_line = 3 * width
-            q_image = QImage(rgb_image.data, width, height, bytes_per_line, QImage.Format_RGB888)
-            
-            # Display
-            pixmap = QPixmap.fromImage(q_image)
-            self.image_label.setPixmap(pixmap)
-            
-            self.info_label.setText(f"Feed: {width}x{height}")
-            
-        except Exception as e:
-            logger.error(f"Failed to update RGB image: {e}")
-
-
 class RobotVision3DApp(QMainWindow):
     """Main application for 3D robot vision with anomaly detection"""
     
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Robot Vision 3D - Anomaly Detection")
-        self.setGeometry(100, 100, 1600, 900)
-        self.setMinimumSize(1400, 800)
+        self.setGeometry(100, 100, 1400, 800)
+        self.setMinimumSize(1200, 700)
         
         # Workers and threads
         self.capture_worker = None
@@ -707,18 +477,8 @@ class RobotVision3DApp(QMainWindow):
         self.waypoints_config = None
         self.model_path = "models/weights/torch/patchcore.pt"
         
-        # Capture state
-        self.is_capturing = False
-        self.capture_complete = False
-        
         self.setup_ui()
         self.setup_connections()
-        
-        # Log VOI settings
-        voi = self.pc_generator.voi
-        self.log(f"Volume of Interest: X=[{voi['x_min']:.1f}, {voi['x_max']:.1f}]m, " +
-                 f"Y=[{voi['y_min']:.1f}, {voi['y_max']:.1f}]m, " +
-                 f"Z=[{voi['z_min']:.1f}, {voi['z_max']:.1f}]m")
         
     def setup_ui(self):
         """Setup user interface"""
@@ -727,19 +487,9 @@ class RobotVision3DApp(QMainWindow):
         
         main_layout = QHBoxLayout(central_widget)
         
-        # Left panel - Controls and RGB feed
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
-        
-        # Control panel
+        # Left panel - Controls
         control_panel = self.create_control_panel()
-        left_layout.addWidget(control_panel)
-        
-        # Live RGB feed
-        self.rgb_widget = LiveRGBWidget()
-        left_layout.addWidget(self.rgb_widget)
-        
-        main_layout.addWidget(left_panel, 1)
+        main_layout.addWidget(control_panel, 1)
         
         # Right panel - 3D Views
         visualization_panel = self.create_visualization_panel()
@@ -780,6 +530,130 @@ class RobotVision3DApp(QMainWindow):
         capture_layout.addWidget(self.progress_bar)
         capture_layout.addWidget(self.status_label)
         
+        # Live RGB Feed
+        rgb_group = QGroupBox("Live RGB Feed")
+        rgb_layout = QVBoxLayout(rgb_group)
+        
+        self.rgb_label = QLabel()
+        self.rgb_label.setMinimumSize(320, 240)
+        self.rgb_label.setMaximumSize(640, 480)
+        self.rgb_label.setScaledContents(True)
+        self.rgb_label.setStyleSheet("QLabel { background-color: black; }")
+        self.rgb_label.setAlignment(Qt.AlignCenter)
+        self.rgb_label.setText("No feed")
+        
+        rgb_layout.addWidget(self.rgb_label)
+        
+        # Visualization controls
+        viz_group = QGroupBox("Visualization")
+        viz_layout = QGridLayout(viz_group)
+        
+        self.voxel_size_spin = QSpinBox()
+        self.voxel_size_spin.setRange(1, 20)
+        self.voxel_size_spin.setValue(5)
+        self.voxel_size_spin.setSuffix(" mm")
+        
+        self.grid_size_spin = QSpinBox()
+        self.grid_size_spin.setRange(1, 10)
+        self.grid_size_spin.setValue(2)
+        self.grid_size_spin.setSuffix(" m")
+        
+        viz_layout.addWidget(QLabel("Voxel Size:"), 0, 0)
+        viz_layout.addWidget(self.voxel_size_spin, 0, 1)
+        viz_layout.addWidget(QLabel("Grid Size:"), 1, 0)
+        viz_layout.addWidget(self.grid_size_spin, 1, 1)
+        
+        # Anomaly detection controls
+        anomaly_group = QGroupBox("Anomaly Detection")
+        anomaly_layout = QGridLayout(anomaly_group)
+        
+        self.image_threshold_slider = QSlider(Qt.Horizontal)
+        self.image_threshold_slider.setRange(0, 100)
+        self.image_threshold_slider.setValue(80)
+        self.image_threshold_label = QLabel("0.80")
+        
+        self.pixel_threshold_slider = QSlider(Qt.Horizontal)
+        self.pixel_threshold_slider.setRange(0, 100)
+        self.pixel_threshold_slider.setValue(80)
+        self.pixel_threshold_label = QLabel("0.80")
+        
+        anomaly_layout.addWidget(QLabel("Image Threshold:"), 0, 0)
+        anomaly_layout.addWidget(self.image_threshold_slider, 0, 1)
+        anomaly_layout.addWidget(self.image_threshold_label, 0, 2)
+        
+        anomaly_layout.addWidget(QLabel("Pixel Threshold:"), 1, 0)
+        anomaly_layout.addWidget(self.pixel_threshold_slider, 1, 1)
+        anomaly_layout.addWidget(self.pixel_threshold_label, 1, 2)
+        
+        # Volume of Interest controls
+        voi_group = QGroupBox("Volume of Interest")
+        voi_layout = QGridLayout(voi_group)
+        
+        self.voi_x_min = QDoubleSpinBox()
+        self.voi_x_max = QDoubleSpinBox()
+        self.voi_y_min = QDoubleSpinBox()
+        self.voi_y_max = QDoubleSpinBox()
+        self.voi_z_min = QDoubleSpinBox()
+        self.voi_z_max = QDoubleSpinBox()
+        
+        for spinbox in [self.voi_x_min, self.voi_x_max, self.voi_y_min, 
+                        self.voi_y_max, self.voi_z_min, self.voi_z_max]:
+            spinbox.setRange(-5.0, 5.0)
+            spinbox.setSingleStep(0.1)
+            spinbox.setDecimals(2)
+            spinbox.setSuffix(" m")
+        
+        # Set default VOI
+        self.voi_x_min.setValue(-1.0)
+        self.voi_x_max.setValue(1.0)
+        self.voi_y_min.setValue(-1.0)
+        self.voi_y_max.setValue(1.0)
+        self.voi_z_min.setValue(0.1)
+        self.voi_z_max.setValue(2.0)
+        
+        voi_layout.addWidget(QLabel("X Min:"), 0, 0)
+        voi_layout.addWidget(self.voi_x_min, 0, 1)
+        voi_layout.addWidget(QLabel("X Max:"), 0, 2)
+        voi_layout.addWidget(self.voi_x_max, 0, 3)
+        
+        voi_layout.addWidget(QLabel("Y Min:"), 1, 0)
+        voi_layout.addWidget(self.voi_y_min, 1, 1)
+        voi_layout.addWidget(QLabel("Y Max:"), 1, 2)
+        voi_layout.addWidget(self.voi_y_max, 1, 3)
+        
+        voi_layout.addWidget(QLabel("Z Min:"), 2, 0)
+        voi_layout.addWidget(self.voi_z_min, 2, 1)
+        voi_layout.addWidget(QLabel("Z Max:"), 2, 2)
+        voi_layout.addWidget(self.voi_z_max, 2, 3)
+        
+        # Anomaly size filtering
+        self.min_anomaly_spin = QSpinBox()
+        self.min_anomaly_spin.setRange(10, 10000)
+        self.min_anomaly_spin.setValue(100)
+        self.min_anomaly_spin.setSuffix(" voxels")
+        
+        self.max_anomaly_spin = QSpinBox()
+        self.max_anomaly_spin.setRange(100, 100000)
+        self.max_anomaly_spin.setValue(50000)
+        self.max_anomaly_spin.setSuffix(" voxels")
+        
+        voi_layout.addWidget(QLabel("Min Anomaly:"), 3, 0)
+        voi_layout.addWidget(self.min_anomaly_spin, 3, 1)
+        voi_layout.addWidget(QLabel("Max Anomaly:"), 3, 2)
+        voi_layout.addWidget(self.max_anomaly_spin, 3, 3)
+        
+        # Clear buttons
+        clear_group = QGroupBox("Clear")
+        clear_layout = QVBoxLayout(clear_group)
+        
+        self.clear_normal_btn = QPushButton("Clear Normal View")
+        self.clear_anomaly_btn = QPushButton("Clear Anomaly View")
+        self.clear_all_btn = QPushButton("Clear All")
+        
+        clear_layout.addWidget(self.clear_normal_btn)
+        clear_layout.addWidget(self.clear_anomaly_btn)
+        clear_layout.addWidget(self.clear_all_btn)
+        
         # Log output
         log_group = QGroupBox("Log")
         log_layout = QVBoxLayout(log_group)
@@ -792,6 +666,11 @@ class RobotVision3DApp(QMainWindow):
         # Add all groups to layout
         layout.addWidget(file_group)
         layout.addWidget(capture_group)
+        layout.addWidget(rgb_group)
+        layout.addWidget(viz_group)
+        layout.addWidget(anomaly_group)
+        layout.addWidget(voi_group)
+        layout.addWidget(clear_group)
         layout.addWidget(log_group)
         layout.addStretch()
         
@@ -808,11 +687,17 @@ class RobotVision3DApp(QMainWindow):
         title.setFont(QFont("Arial", 14, QFont.Bold))
         layout.addWidget(title)
         
+        # Status label for capture state
+        self.capture_status_label = QLabel("Live Point Cloud Accumulation")
+        self.capture_status_label.setAlignment(Qt.AlignCenter)
+        self.capture_status_label.setFont(QFont("Arial", 12))
+        layout.addWidget(self.capture_status_label)
+        
         # Split view
         splitter = QSplitter(Qt.Horizontal)
         
         self.normal_viewer = PyVistaViewer("Normal RGB Point Cloud")
-        self.anomaly_viewer = PyVistaViewer("Anomaly Heatmap Point Cloud")
+        self.anomaly_viewer = PyVistaViewer("Anomaly Highlighted Point Cloud")
         
         splitter.addWidget(self.normal_viewer)
         splitter.addWidget(self.anomaly_viewer)
@@ -831,6 +716,31 @@ class RobotVision3DApp(QMainWindow):
         # Capture buttons
         self.start_capture_btn.clicked.connect(self.start_capture)
         self.stop_capture_btn.clicked.connect(self.stop_capture)
+        
+        # Clear buttons
+        self.clear_normal_btn.clicked.connect(self.normal_viewer.clear_point_cloud)
+        self.clear_anomaly_btn.clicked.connect(self.anomaly_viewer.clear_point_cloud)
+        self.clear_all_btn.clicked.connect(self.clear_all_views)
+        
+        # Threshold sliders
+        self.image_threshold_slider.valueChanged.connect(self.update_image_threshold)
+        self.pixel_threshold_slider.valueChanged.connect(self.update_pixel_threshold)
+        
+        # Visualization controls
+        self.voxel_size_spin.valueChanged.connect(self.update_voxel_size)
+        self.grid_size_spin.valueChanged.connect(self.update_grid_size)
+        
+        # VOI controls
+        self.voi_x_min.valueChanged.connect(self.update_voi)
+        self.voi_x_max.valueChanged.connect(self.update_voi)
+        self.voi_y_min.valueChanged.connect(self.update_voi)
+        self.voi_y_max.valueChanged.connect(self.update_voi)
+        self.voi_z_min.valueChanged.connect(self.update_voi)
+        self.voi_z_max.valueChanged.connect(self.update_voi)
+        
+        # Anomaly size filters
+        self.min_anomaly_spin.valueChanged.connect(self.update_anomaly_size_filters)
+        self.max_anomaly_spin.valueChanged.connect(self.update_anomaly_size_filters)
         
     def load_waypoints_config(self):
         """Load waypoints configuration"""
@@ -867,87 +777,47 @@ class RobotVision3DApp(QMainWindow):
             return
         
         try:
-            # Reset state
-            self.is_capturing = True
-            self.capture_complete = False
-            self._waypoint_count = 0  # Reset waypoint counter
-            
-            # Clear existing point clouds
-            self.normal_viewer.clear_point_cloud()
-            self.anomaly_viewer.clear_point_cloud()
-            self.log("Cleared existing point clouds")
-            
             # Setup inference worker first
-            self.log("Setting up inference worker...")
             self.setup_inference_worker()
             
             # Setup capture worker
-            self.log("Setting up capture worker...")
             self.setup_capture_worker()
             
-            # Verify signal connections
-            self.log("Signal connections established")
-            
             # Start inference worker
-            self.log("Starting inference thread...")
             self.infer_thread.start()
             
-            # Wait for inference to be ready
-            self.log("Waiting for inference to initialize...")
-            QTimer.singleShot(500, lambda: self.start_capture_delayed())
-            
-        except Exception as e:
-            import traceback
-            error_msg = f"Failed to start capture: {e}\n{traceback.format_exc()}"
-            QMessageBox.critical(self, "Error", error_msg)
-            self.log(error_msg)
-            
-            # Reset state on error
-            self.is_capturing = False
-            self.start_capture_btn.setEnabled(True)
-            self.stop_capture_btn.setEnabled(False)
-            
-    def start_capture_delayed(self):
-        """Start capture after delay"""
-        try:
-            self.log("Starting capture thread...")
+            # Start capture worker
             self.capture_thread.start()
             
             # Update UI
             self.start_capture_btn.setEnabled(False)
             self.stop_capture_btn.setEnabled(True)
             self.status_label.setText("Capturing...")
-            self.log("Capture and inference started successfully")
+            self.capture_status_label.setText("Live Point Cloud Accumulation")
+            self.log("Started capture and inference")
+            
         except Exception as e:
-            error_msg = f"Failed to start capture thread: {e}"
-            self.log(error_msg)
-            QMessageBox.critical(self, "Error", error_msg)
+            QMessageBox.critical(self, "Error", f"Failed to start capture: {e}")
+            self.log(f"Error starting capture: {e}")
     
     def stop_capture(self):
         """Stop capture and inference"""
         try:
-            self.is_capturing = False
-            
-            if self.capture_worker is not None:
+            if self.capture_worker:
                 self.capture_worker.stop_capture()
-            
-            # Don't stop inference here - let it finish processing
-            # It will be stopped when capture finishes
-            
-            self.status_label.setText("Stopping...")
-            self.log("Stopping capture...")
+            if self.infer_worker:
+                self.infer_worker.stop_inference()
+                
+            self.start_capture_btn.setEnabled(True)
+            self.stop_capture_btn.setEnabled(False)
+            self.status_label.setText("Stopped")
+            self.log("Stopped capture and inference")
             
         except Exception as e:
             self.log(f"Error stopping capture: {e}")
     
     def setup_capture_worker(self):
         """Setup capture worker and thread"""
-        # Clean up any existing threads
-        if hasattr(self, 'capture_thread') and self.capture_thread is not None:
-            if self.capture_thread.isRunning():
-                self.capture_thread.quit()
-                self.capture_thread.wait()
-            
         self.capture_thread = QThread()
         self.capture_worker = CaptureWorker(self.waypoints_config)
         self.capture_worker.moveToThread(self.capture_thread)
@@ -957,18 +827,11 @@ class RobotVision3DApp(QMainWindow):
         self.capture_worker.progress.connect(self.progress_bar.setValue)
         self.capture_worker.error.connect(self.log)
         self.capture_worker.live_frame.connect(self.process_live_frame)
-        self.capture_worker.finished.connect(self.on_capture_finished)  # Call this first
-        self.capture_worker.finished.connect(self.capture_thread.quit)  # Then quit thread
-        self.capture_thread.finished.connect(self.capture_thread.deleteLater)
+        self.capture_worker.finished.connect(self.capture_thread.quit)
+        self.capture_worker.finished.connect(self.on_capture_finished)
         
     def setup_inference_worker(self):
         """Setup inference worker and thread"""
-        # Clean up any existing threads
-        if hasattr(self, 'infer_thread') and self.infer_thread is not None:
-            if self.infer_thread.isRunning():
-                self.infer_thread.quit()
-                self.infer_thread.wait()
-            
         self.infer_thread = QThread()
         self.infer_worker = InferWorker(self.model_path)
         self.infer_worker.moveToThread(self.infer_thread)
@@ -976,44 +839,54 @@ class RobotVision3DApp(QMainWindow):
         # Enable real-time mode
         self.infer_worker.enable_real_time_mode(True)
         
-        # Set hardcoded VOI (same as in PointCloudGenerator)
-        hardcoded_voi = {
-            'x_min': -1.0, 'x_max': 1.0,
-            'y_min': -1.0, 'y_max': 1.0,
-            'z_min': 0.1, 'z_max': 2.0
-        }
-        self.infer_worker.set_volume_of_interest(hardcoded_voi)
+        # Set VOI and anomaly size filters
+        self.update_voi()
+        self.update_anomaly_size_filters()
         
         # Connect signals
         self.infer_thread.started.connect(self.infer_worker.start_inference)
         self.infer_worker.error.connect(self.log)
         self.infer_worker.live_inference_result.connect(self.update_3d_visualization)
-        self.infer_worker.anomaly_accumulation_complete.connect(self.on_anomaly_accumulation_complete)
+        self.infer_worker.capture_completed.connect(self.on_capture_completed)
         self.infer_worker.finished.connect(self.infer_thread.quit)
-        self.infer_worker.finished.connect(self.on_inference_finished)
-        self.infer_thread.finished.connect(self.infer_thread.deleteLater)
     
     @Slot(object)
     def process_live_frame(self, frame_data):
         """Process live frame from capture worker"""
-        # Update RGB display
-        if 'rgb' in frame_data:
-            self.rgb_widget.update_image(frame_data['rgb'])
+        # Update RGB feed
+        self.update_rgb_feed(frame_data["rgb"])
         
-        # Forward to inference worker
-        if (self.infer_worker is not None and 
-            hasattr(self.infer_worker, '_running') and 
-            self.infer_worker._running):
+        # Pass to inference worker
+        if self.infer_worker:
             self.infer_worker.process_live_frame(frame_data)
-        else:
-            logger.warning("Inference worker not ready to process frame")
+    
+    def update_rgb_feed(self, bgr_image):
+        """Update live RGB feed display"""
+        try:
+            # Convert BGR to RGB for display
+            rgb = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+            
+            # Convert to QImage
+            h, w, ch = rgb.shape
+            bytes_per_line = ch * w
+            qt_image = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            
+            # Convert to QPixmap and display
+            pixmap = QPixmap.fromImage(qt_image)
+            
+            # Scale to fit label while maintaining aspect ratio
+            scaled_pixmap = pixmap.scaled(self.rgb_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.rgb_label.setPixmap(scaled_pixmap)
+            
+        except Exception as e:
+            logger.error(f"Error updating RGB feed: {e}")
     
     @Slot(object)
     def update_3d_visualization(self, inference_result):
         """Update 3D visualization with inference results"""
         try:
             frame_data = inference_result["frame_data"]
-            normalized_anomaly_map = inference_result.get("normalized_anomaly_map")
+            normalized_anomaly_map = inference_result["normalized_anomaly_map"]
             has_anomaly = inference_result["has_anomaly"]
             
             # Extract data
@@ -1032,31 +905,28 @@ class RobotVision3DApp(QMainWindow):
                 rgb_image, depth_image, camera_matrix, transform_matrix
             )
             
-            # Generate anomaly heatmap point cloud
-            anomaly_cloud = self.pc_generator.create_anomaly_point_cloud_heatmap(
-                rgb_image, depth_image, camera_matrix, normalized_anomaly_map, transform_matrix
+            # Generate anomaly point cloud with full normalized anomaly map
+            anomaly_cloud = self.pc_generator.create_anomaly_point_cloud(
+                rgb_image, depth_image, camera_matrix, 
+                normalized_anomaly_map,  # Use normalized map instead of binary mask
+                transform_matrix
             )
             
             # Check if point clouds are valid
             if normal_cloud.n_points == 0:
-                logger.warning("Empty normal point cloud generated")
+                self.log("Warning: Empty normal point cloud generated")
                 return
                 
-            # Add to viewers
-            self.normal_viewer.add_point_cloud(normal_cloud)
-            self.anomaly_viewer.add_point_cloud(anomaly_cloud)
+            # Add to viewers (maintain camera view)
+            self.normal_viewer.add_point_cloud(normal_cloud, maintain_view=True)
+            self.anomaly_viewer.add_point_cloud(anomaly_cloud, maintain_view=True)
             
-            # Log progress every 10 waypoints
+            # Log progress
             waypoint_id = frame_data.get("waypoint_id", "unknown")
-            if hasattr(self, '_waypoint_count'):
-                self._waypoint_count += 1
-            else:
-                self._waypoint_count = 1
-                
-            if self._waypoint_count % 10 == 0:
-                normal_total = self.normal_viewer.point_count
-                anomaly_total = self.anomaly_viewer.point_count
-                self.log(f"Progress: {self._waypoint_count} waypoints, Normal={normal_total:,} pts, Anomaly={anomaly_total:,} pts")
+            normal_total = self.normal_viewer.point_count
+            anomaly_total = self.anomaly_viewer.point_count
+            
+            self.log(f"Added {waypoint_id}: Normal={normal_total:,} pts, Anomaly={anomaly_total:,} pts")
             
             # Log anomaly detection
             if has_anomaly:
@@ -1068,93 +938,486 @@ class RobotVision3DApp(QMainWindow):
             self.log(f"Error updating 3D visualization: {e}")
             logger.error(f"3D visualization error: {e}\n{traceback.format_exc()}")
     
+    def update_image_threshold(self, value):
+        """Update image threshold"""
+        threshold = value / 100.0
+        self.image_threshold_label.setText(f"{threshold:.2f}")
+        if self.infer_worker:
+            self.infer_worker.update_thresholds(image_threshold=threshold)
+    
+    def update_pixel_threshold(self, value):
+        """Update pixel threshold"""
+        threshold = value / 100.0
+        self.pixel_threshold_label.setText(f"{threshold:.2f}")
+        if self.infer_worker:
+            self.infer_worker.update_thresholds(pixel_threshold=threshold)
+            
+    def update_voxel_size(self, value):
+        """Update voxel size for both viewers"""
+        self.normal_viewer.set_voxel_size(value)
+        self.anomaly_viewer.set_voxel_size(value)
+        self.log(f"Voxel size updated to {value}mm")
+        
+    def update_grid_size(self, value):
+        """Update grid size for both viewers"""
+        self.normal_viewer.set_grid_size(value)
+        self.anomaly_viewer.set_grid_size(value)
+        self.log(f"Grid size updated to {value}m")
+    
+    def update_voi(self):
+        """Update volume of interest"""
+        bounds = (
+            self.voi_x_min.value(), self.voi_x_max.value(),
+            self.voi_y_min.value(), self.voi_y_max.value(),
+            self.voi_z_min.value(), self.voi_z_max.value()
+        )
+        if self.infer_worker:
+            self.infer_worker.set_volume_of_interest(bounds)
+            self.log(f"VOI updated: X[{bounds[0]:.2f}, {bounds[1]:.2f}], Y[{bounds[2]:.2f}, {bounds[3]:.2f}], Z[{bounds[4]:.2f}, {bounds[5]:.2f}]")
+    
+    def update_anomaly_size_filters(self):
+        """Update anomaly size filters"""
+        min_vol = self.min_anomaly_spin.value()
+        max_vol = self.max_anomaly_spin.value()
+        if self.infer_worker:
+            self.infer_worker.set_anomaly_size_filters(min_vol, max_vol)
+            self.log(f"Anomaly size filters updated: {min_vol} - {max_vol} voxels")
+    
     @Slot(object)
-    def on_anomaly_accumulation_complete(self, result):
-        """Handle completed anomaly accumulation and bounding box computation"""
+    def on_capture_completed(self, accumulated_data):
+        """Handle capture completion and process accumulated data"""
+        self.log("Capture completed, processing accumulated data...")
+        
         try:
-            self.log("Anomaly accumulation complete signal received")
+            num_frames = len(accumulated_data["anomaly_maps"])
+            self.log(f"Processing {num_frames} frames for 3D anomaly detection...")
             
-            bounding_boxes = result.get('bounding_boxes', [])
-            
-            self.log(f"Anomaly processing complete: {len(bounding_boxes)} regions detected")
-            
-            if len(bounding_boxes) > 0:
-                # Add bounding boxes to viewers
-                self.normal_viewer.add_bounding_boxes(bounding_boxes)
-                self.anomaly_viewer.add_bounding_boxes(bounding_boxes)
-                
-                # Log RGB image associations
-                for i, bbox in enumerate(bounding_boxes):
-                    if bbox.get('best_view'):
-                        self.log(f"BBox {i}: Best view from {bbox['best_view']} (score: {bbox['max_score']:.3f})")
-            else:
-                self.log("No anomalies detected within VOI thresholds")
-            
-            # Always voxelize point clouds after processing
-            self.log("Starting voxelization...")
-            
-            # Check if we have point clouds to voxelize
-            if self.normal_viewer.current_cloud.n_points > 0:
-                self.log(f"Voxelizing normal view ({self.normal_viewer.current_cloud.n_points} points)")
-                self.normal_viewer.voxelize_point_cloud()
-            else:
-                self.log("Warning: No points in normal viewer to voxelize")
-                
-            if self.anomaly_viewer.current_cloud.n_points > 0:
-                self.log(f"Voxelizing anomaly view ({self.anomaly_viewer.current_cloud.n_points} points)")
-                self.anomaly_viewer.voxelize_point_cloud()
-            else:
-                self.log("Warning: No points in anomaly viewer to voxelize")
-            
-            self.status_label.setText("Post-processing complete")
-            self.log("Post-processing complete")
+            # Process accumulated data to generate voxelized representation and bounding boxes
+            self.process_final_3d_anomalies(accumulated_data)
             
         except Exception as e:
-            self.log(f"Error in post-processing: {e}")
-            logger.error(f"Anomaly accumulation error: {traceback.format_exc()}")
+            self.log(f"Error in post-capture processing: {e}")
+            logger.error(traceback.format_exc())
+    
+    def process_final_3d_anomalies(self, accumulated_data):
+        """Process accumulated data to create voxelized representation and detect 3D anomaly regions"""
+        
+        # Extract accumulated data
+        anomaly_maps = accumulated_data["normalized_maps"]
+        rgb_images = accumulated_data["rgb_images"]
+        depth_images = accumulated_data["depth_images"]
+        transforms = accumulated_data["transforms"]
+        waypoint_ids = accumulated_data["waypoint_ids"]
+        frame_data_list = accumulated_data["frame_data"]
+        pixel_threshold = accumulated_data["pixel_threshold"]
+        voi_bounds = accumulated_data["voi_bounds"]
+        min_anomaly_vol = accumulated_data["min_anomaly_volume"]
+        max_anomaly_vol = accumulated_data["max_anomaly_volume"]
+        
+        self.log("Creating combined point clouds...")
+        
+        # Create combined point clouds
+        all_normal_points = []
+        all_anomaly_points = []
+        all_anomaly_scores = []
+        
+        # Process each frame
+        for i, (amap, rgb, depth, transform, frame_data) in enumerate(
+            zip(anomaly_maps, rgb_images, depth_images, transforms, frame_data_list)
+        ):
+            camera_matrix = frame_data["camera_matrix"]
+            
+            # Generate normal point cloud
+            normal_cloud = self.pc_generator.create_point_cloud(
+                rgb, depth, camera_matrix, transform
+            )
+            
+            # Generate anomaly point cloud with scores
+            anomaly_cloud = self.pc_generator.create_anomaly_point_cloud(
+                rgb, depth, camera_matrix, amap, transform
+            )
+            
+            if normal_cloud.n_points > 0:
+                all_normal_points.append(normal_cloud.points)
+            
+            if anomaly_cloud.n_points > 0:
+                all_anomaly_points.append(anomaly_cloud.points)
+                all_anomaly_scores.append(anomaly_cloud["Anomaly_Score"])
+        
+        # Combine all points
+        if all_normal_points:
+            combined_normal_points = np.vstack(all_normal_points)
+        else:
+            combined_normal_points = np.array([])
+            
+        if all_anomaly_points:
+            combined_anomaly_points = np.vstack(all_anomaly_points)
+            combined_anomaly_scores = np.hstack(all_anomaly_scores)
+        else:
+            combined_anomaly_points = np.array([])
+            combined_anomaly_scores = np.array([])
+        
+        self.log(f"Combined point clouds: Normal={len(combined_normal_points):,}, Anomaly={len(combined_anomaly_points):,}")
+        
+        # Voxelize the point clouds
+        voxel_size = self.voxel_size_spin.value() / 1000.0  # Convert mm to meters
+        
+        self.log(f"Voxelizing with voxel size: {voxel_size*1000:.1f}mm")
+        
+        # Create voxelized representations
+        normal_voxel_cloud = self.voxelize_points(combined_normal_points, voxel_size)
+        anomaly_voxel_cloud = self.voxelize_anomaly_points(
+            combined_anomaly_points, combined_anomaly_scores, voxel_size, pixel_threshold
+        )
+        
+        # Detect 3D anomaly regions (bounding boxes)
+        self.log("Detecting 3D anomaly regions...")
+        bounding_boxes = self.detect_3d_anomaly_regions(
+            anomaly_voxel_cloud, voxel_size, voi_bounds, min_anomaly_vol, max_anomaly_vol
+        )
+        
+        self.log(f"Found {len(bounding_boxes)} anomaly regions")
+        
+        # Associate RGB images with bounding boxes
+        self.associate_rgb_images(bounding_boxes, rgb_images, depth_images, 
+                                 transforms, waypoint_ids, frame_data_list)
+        
+        # Update viewers with voxelized data and bounding boxes
+        self.update_final_visualization(normal_voxel_cloud, anomaly_voxel_cloud, bounding_boxes)
+    
+    def voxelize_points(self, points, voxel_size):
+        """Voxelize point cloud"""
+        if len(points) == 0:
+            return pv.PolyData()
+        
+        # Create PyVista point cloud
+        cloud = pv.PolyData(points)
+        
+        # Voxelize using PyVista
+        # Create a uniform grid that encompasses all points
+        bounds = cloud.bounds
+        x_min, x_max, y_min, y_max, z_min, z_max = bounds
+        
+        # Calculate grid dimensions
+        nx = int(np.ceil((x_max - x_min) / voxel_size))
+        ny = int(np.ceil((y_max - y_min) / voxel_size))
+        nz = int(np.ceil((z_max - z_min) / voxel_size))
+        
+        # Create voxel grid
+        grid = pv.ImageData(
+            dimensions=(nx + 1, ny + 1, nz + 1),
+            spacing=(voxel_size, voxel_size, voxel_size),
+            origin=(x_min, y_min, z_min)
+        )
+        
+        # Map points to voxels
+        voxel_centers = []
+        
+        # Get voxel indices for each point
+        voxel_indices = np.floor((points - [x_min, y_min, z_min]) / voxel_size).astype(int)
+        
+        # Get unique voxels
+        unique_voxels = np.unique(voxel_indices, axis=0)
+        
+        # Convert back to world coordinates (voxel centers)
+        for voxel_idx in unique_voxels:
+            center = [x_min, y_min, z_min] + (voxel_idx + 0.5) * voxel_size
+            voxel_centers.append(center)
+        
+        if voxel_centers:
+            voxel_cloud = pv.PolyData(np.array(voxel_centers))
+            
+            # Create cube glyphs for visualization
+            cube = pv.Cube(center=(0, 0, 0), x_length=voxel_size, 
+                          y_length=voxel_size, z_length=voxel_size)
+            voxel_mesh = voxel_cloud.glyph(geom=cube)
+            
+            return voxel_mesh
+        else:
+            return pv.PolyData()
+    
+    def voxelize_anomaly_points(self, points, scores, voxel_size, threshold):
+        """Voxelize anomaly points with scores"""
+        if len(points) == 0:
+            return pv.PolyData()
+        
+        # Filter by threshold
+        mask = scores > threshold
+        filtered_points = points[mask]
+        filtered_scores = scores[mask]
+        
+        if len(filtered_points) == 0:
+            return pv.PolyData()
+        
+        # Create PyVista point cloud
+        cloud = pv.PolyData(filtered_points)
+        
+        # Get bounds
+        bounds = cloud.bounds
+        x_min, x_max, y_min, y_max, z_min, z_max = bounds
+        
+        # Calculate voxel indices
+        voxel_indices = np.floor((filtered_points - [x_min, y_min, z_min]) / voxel_size).astype(int)
+        
+        # Aggregate scores by voxel (take maximum score per voxel)
+        voxel_dict = {}
+        for i, (idx, score) in enumerate(zip(voxel_indices, filtered_scores)):
+            key = tuple(idx)
+            if key not in voxel_dict or score > voxel_dict[key]:
+                voxel_dict[key] = score
+        
+        # Create voxel centers and scores
+        voxel_centers = []
+        voxel_scores = []
+        
+        for voxel_idx, score in voxel_dict.items():
+            center = [x_min, y_min, z_min] + (np.array(voxel_idx) + 0.5) * voxel_size
+            voxel_centers.append(center)
+            voxel_scores.append(score)
+        
+        if voxel_centers:
+            voxel_cloud = pv.PolyData(np.array(voxel_centers))
+            voxel_cloud["Anomaly_Score"] = np.array(voxel_scores)
+            
+            # Create cube glyphs
+            cube = pv.Cube(center=(0, 0, 0), x_length=voxel_size, 
+                          y_length=voxel_size, z_length=voxel_size)
+            voxel_mesh = voxel_cloud.glyph(geom=cube)
+            
+            # Transfer scores to mesh
+            voxel_mesh["Anomaly_Score"] = np.repeat(voxel_scores, cube.n_points)
+            
+            return voxel_mesh
+        else:
+            return pv.PolyData()
+    
+    def detect_3d_anomaly_regions(self, anomaly_voxel_cloud, voxel_size, 
+                                  voi_bounds, min_vol, max_vol):
+        """Detect 3D bounding boxes for anomaly regions"""
+        bounding_boxes = []
+        
+        if anomaly_voxel_cloud.n_points == 0:
+            return bounding_boxes
+        
+        # Get voxel centers (every nth point where n is points per voxel)
+        # For a cube, there are 8 vertices
+        points_per_voxel = 8
+        voxel_centers = anomaly_voxel_cloud.points[::points_per_voxel]
+        anomaly_scores = anomaly_voxel_cloud["Anomaly_Score"][::points_per_voxel]
+        
+        # Filter by VOI if provided
+        if voi_bounds is not None:
+            x_min, x_max, y_min, y_max, z_min, z_max = voi_bounds
+            voi_mask = (
+                (voxel_centers[:, 0] >= x_min) & (voxel_centers[:, 0] <= x_max) &
+                (voxel_centers[:, 1] >= y_min) & (voxel_centers[:, 1] <= y_max) &
+                (voxel_centers[:, 2] >= z_min) & (voxel_centers[:, 2] <= z_max)
+            )
+            voxel_centers = voxel_centers[voi_mask]
+            anomaly_scores = anomaly_scores[voi_mask]
+        
+        if len(voxel_centers) == 0:
+            return bounding_boxes
+        
+        # Use DBSCAN clustering to find connected anomaly regions
+        # Distance threshold is slightly larger than voxel diagonal
+        eps = voxel_size * np.sqrt(3) * 1.1
+        
+        if HAS_SKLEARN:
+            clustering = DBSCAN(eps=eps, min_samples=1).fit(voxel_centers)
+            labels = clustering.labels_
+        else:
+            # Fallback: treat all voxels as one cluster
+            self.log("Warning: sklearn not available, treating all anomalies as one region")
+            labels = np.zeros(len(voxel_centers), dtype=int)
+        
+        # Process each cluster
+        unique_labels = np.unique(labels[labels >= 0])
+        
+        for label in unique_labels:
+            cluster_mask = labels == label
+            cluster_points = voxel_centers[cluster_mask]
+            cluster_scores = anomaly_scores[cluster_mask]
+            
+            # Check volume constraints
+            num_voxels = len(cluster_points)
+            if num_voxels < min_vol or num_voxels > max_vol:
+                continue
+            
+            # Calculate bounding box
+            bbox_min = np.min(cluster_points, axis=0) - voxel_size/2
+            bbox_max = np.max(cluster_points, axis=0) + voxel_size/2
+            center = (bbox_min + bbox_max) / 2
+            dimensions = bbox_max - bbox_min
+            
+            # Calculate average anomaly score
+            avg_score = np.mean(cluster_scores)
+            max_score = np.max(cluster_scores)
+            
+            bbox_info = {
+                "id": len(bounding_boxes),
+                "center": center,
+                "dimensions": dimensions,
+                "min": bbox_min,
+                "max": bbox_max,
+                "num_voxels": num_voxels,
+                "avg_score": avg_score,
+                "max_score": max_score,
+                "points": cluster_points,
+                "rgb_image": None  # Will be filled by associate_rgb_images
+            }
+            
+            bounding_boxes.append(bbox_info)
+        
+        # Sort by average score (highest first)
+        bounding_boxes.sort(key=lambda x: x["avg_score"], reverse=True)
+        
+        return bounding_boxes
+    
+    def associate_rgb_images(self, bounding_boxes, rgb_images, depth_images, 
+                            transforms, waypoint_ids, frame_data_list):
+        """Associate each bounding box with the best RGB image"""
+        
+        for bbox in bounding_boxes:
+            best_image_idx = None
+            best_visibility_score = 0
+            bbox_center = bbox["center"]
+            
+            # Check visibility from each camera position
+            for i, (transform, depth, frame_data) in enumerate(
+                zip(transforms, depth_images, frame_data_list)
+            ):
+                # Transform bbox center to camera coordinates
+                bbox_center_homo = np.append(bbox_center, 1)
+                transform_inv = np.linalg.inv(transform)
+                bbox_cam = transform_inv @ bbox_center_homo
+                bbox_cam = bbox_cam[:3]
+                
+                # Check if point is in front of camera
+                if bbox_cam[2] <= 0:
+                    continue
+                
+                # Project to image coordinates
+                camera_matrix = frame_data["camera_matrix"]
+                fx, fy = camera_matrix[0, 0], camera_matrix[1, 1]
+                cx, cy = camera_matrix[0, 2], camera_matrix[1, 2]
+                
+                u = int(fx * bbox_cam[0] / bbox_cam[2] + cx)
+                v = int(fy * bbox_cam[1] / bbox_cam[2] + cy)
+                
+                # Check if within image bounds
+                h, w = depth.shape
+                if 0 <= u < w and 0 <= v < h:
+                    # Check depth consistency
+                    expected_depth = bbox_cam[2]
+                    actual_depth = depth[v, u]
+                    
+                    if actual_depth > 0 and abs(actual_depth - expected_depth) < 0.1:
+                        # Calculate visibility score (inverse of distance)
+                        visibility_score = 1.0 / expected_depth
+                        
+                        if visibility_score > best_visibility_score:
+                            best_visibility_score = visibility_score
+                            best_image_idx = i
+            
+            # Assign best image
+            if best_image_idx is not None:
+                bbox["rgb_image"] = waypoint_ids[best_image_idx]
+                bbox["rgb_image_path"] = f"wp{waypoint_ids[best_image_idx]}_rgb.png"
+                self.log(f"Anomaly bbox {bbox['id']} associated with image: {bbox['rgb_image_path']}")
+    
+    def update_final_visualization(self, normal_voxel_cloud, anomaly_voxel_cloud, bounding_boxes):
+        """Update viewers with voxelized data and bounding boxes"""
+        self.log("Updating visualization with voxelized data...")
+        
+        # Clear current point clouds
+        self.normal_viewer.clear_point_cloud()
+        self.anomaly_viewer.clear_point_cloud()
+        
+        # Add voxelized normal cloud
+        if normal_voxel_cloud.n_points > 0:
+            self.normal_viewer.plotter.add_mesh(
+                normal_voxel_cloud, 
+                color='lightblue', 
+                opacity=0.8,
+                name="normal_voxels"
+            )
+            self.normal_viewer.info_label.setText(f"Voxels: {normal_voxel_cloud.n_cells:,}")
+        
+        # Add voxelized anomaly cloud with color mapping
+        if anomaly_voxel_cloud.n_points > 0:
+            self.anomaly_viewer.plotter.add_mesh(
+                anomaly_voxel_cloud,
+                scalars="Anomaly_Score",
+                cmap='jet',
+                opacity=0.9,
+                name="anomaly_voxels"
+            )
+            self.anomaly_viewer.info_label.setText(f"Anomaly Voxels: {anomaly_voxel_cloud.n_cells:,}")
+        
+        # Add bounding boxes to both viewers
+        for bbox in bounding_boxes:
+            # Create box mesh
+            box = pv.Box(bounds=[
+                bbox["min"][0], bbox["max"][0],
+                bbox["min"][1], bbox["max"][1],
+                bbox["min"][2], bbox["max"][2]
+            ])
+            
+            # Add to normal viewer (green boxes)
+            self.normal_viewer.plotter.add_mesh(
+                box, 
+                color='green', 
+                style='wireframe',
+                line_width=3,
+                name=f"bbox_normal_{bbox['id']}"
+            )
+            
+            # Add to anomaly viewer (red boxes with opacity based on score)
+            opacity = 0.3 + 0.7 * bbox["avg_score"]  # Scale opacity by score
+            self.anomaly_viewer.plotter.add_mesh(
+                box,
+                color='red',
+                style='surface',
+                opacity=opacity,
+                name=f"bbox_anomaly_{bbox['id']}"
+            )
+            
+            # Add text label
+            label = f"A{bbox['id']}: {bbox['avg_score']:.2f}"
+            self.anomaly_viewer.plotter.add_text(
+                label,
+                position=bbox["center"],
+                font_size=8,
+                name=f"label_{bbox['id']}"
+            )
+        
+        # Log summary
+        self.log(f"Visualization complete: {len(bounding_boxes)} anomaly regions detected")
+        for bbox in bounding_boxes:
+            self.log(f"  - Region {bbox['id']}: {bbox['num_voxels']} voxels, "
+                    f"score={bbox['avg_score']:.3f}, image={bbox.get('rgb_image_path', 'None')}")
+        
+        # Update status
+        self.capture_status_label.setText(f"Voxelized View - {len(bounding_boxes)} Anomaly Regions Detected")
+        
+        # Render
+        self.normal_viewer.plotter.render()
+        self.anomaly_viewer.plotter.render()
+    
+    def clear_all_views(self):
+        """Clear all views"""
+        self.normal_viewer.clear_point_cloud()
+        self.anomaly_viewer.clear_point_cloud()
+        self.log("Cleared all views")
     
     def on_capture_finished(self):
         """Handle capture finished"""
-        self.capture_complete = True
-        self.is_capturing = False
-        
-        # Clean up capture references
-        self.capture_worker = None
-        self.capture_thread = None
-        
-        self.status_label.setText("Capture completed - Processing anomalies...")
-        self.log("Capture completed, processing anomalies...")
-        
-        # Add a small delay to ensure all frames are processed
-        QTimer.singleShot(1000, self.trigger_anomaly_processing)
-        
-    def trigger_anomaly_processing(self):
-        """Trigger anomaly accumulation processing after delay"""
-        if self.infer_worker is not None:
-            # Log current state
-            if hasattr(self.infer_worker, 'accumulated_anomaly_maps'):
-                self.log(f"Triggering anomaly processing with {len(self.infer_worker.accumulated_anomaly_maps)} accumulated frames")
-            else:
-                self.log("Triggering anomaly processing...")
-                
-            # Stop inference which will trigger accumulated anomaly processing
-            self.infer_worker.stop_inference()
-        else:
-            # If no inference worker, just update UI
-            self.start_capture_btn.setEnabled(True)
-            self.stop_capture_btn.setEnabled(False)
-            self.status_label.setText("Capture completed")
-    
-    def on_inference_finished(self):
-        """Handle inference worker finished"""
         self.start_capture_btn.setEnabled(True)
         self.stop_capture_btn.setEnabled(False)
-        self.status_label.setText("Ready")
-        self.log("Inference processing finished")
-        
-        # Clean up references
-        self.infer_worker = None
-        self.infer_thread = None
+        self.status_label.setText("Capture completed")
+        self.capture_status_label.setText("Processing for voxelization...")
+        self.log("Capture completed")
     
     def log(self, message):
         """Add message to log"""
@@ -1165,22 +1428,6 @@ class RobotVision3DApp(QMainWindow):
     def closeEvent(self, event):
         """Clean up when closing"""
         try:
-            # Stop any running captures
-            if self.is_capturing:
-                self.stop_capture()
-                
-            # Wait for threads to finish
-            if hasattr(self, 'capture_thread') and self.capture_thread is not None:
-                if self.capture_thread.isRunning():
-                    self.capture_thread.quit()
-                    self.capture_thread.wait(2000)
-                
-            if hasattr(self, 'infer_thread') and self.infer_thread is not None:
-                if self.infer_thread.isRunning():
-                    self.infer_thread.quit()
-                    self.infer_thread.wait(2000)
-                
-            # Close PyVista plotters
             if hasattr(self, 'normal_viewer') and self.normal_viewer.plotter:
                 self.normal_viewer.plotter.close()
             if hasattr(self, 'anomaly_viewer') and self.anomaly_viewer.plotter:
