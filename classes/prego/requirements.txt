@@ -1,0 +1,39 @@
+# Core dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.21.0
+scipy>=1.7.0
+scikit-learn>=1.0.0
+pandas>=1.3.0
+matplotlib>=3.5.0
+seaborn>=0.11.0
+tqdm>=4.62.0
+
+# Video processing
+opencv-python>=4.5.0
+pillow>=8.0.0
+
+# Model and training
+transformers>=4.30.0
+accelerate>=0.20.0
+peft>=0.7.0
+bitsandbytes>=0.43.0
+sentencepiece>=0.1.99
+
+# Utilities
+PyYAML>=6.0
+tensorboard>=2.11.0
+wandb>=0.13.0
+gdown>=4.6.0
+
+# For evaluation
+scikit-image>=0.19.0
+einops>=0.6.0
+
+# For anticipation module (LLAMA)
+fairscale>=0.4.4
+fire>=0.4.0
+
+# Additional ML tools
+xformers>=0.0.16
+flash-attn>=2.3.0
