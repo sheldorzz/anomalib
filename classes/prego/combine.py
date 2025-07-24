@@ -1,144 +1,164 @@
 #!/usr/bin/env python3
 """
-Script to combine multiple Assembly101-O directories into one
+Script to combine multiple PREGO dataset directories into one
 """
 
 import os
 import shutil
+import argparse
 from pathlib import Path
 from tqdm import tqdm
-import argparse
 
 
-def combine_datasets(source_dirs, output_dir="Assembly101-O_combined", move=False):
-    """
-    Combine multiple Assembly101-O directories into one
+def combine_datasets(source_dir, output_dir, dataset_name="Assembly101-O"):
+    """Combine multiple dataset directories into one"""
     
-    Args:
-        source_dirs: List of source directory paths
-        output_dir: Output directory name
-        move: If True, move files instead of copying
-    """
+    source_path = Path(source_dir)
+    output_path = Path(output_dir) / dataset_name
     
     # Create output directory structure
-    output_path = Path(output_dir)
-    subdirs = ["rgb_anet_resnet50", "rgb_as_flow", "target_perframe"]
+    dirs_to_create = [
+        output_path / "rgb_anet_resnet50",
+        output_path / "rgb_as_flow",
+        output_path / "target_perframe"
+    ]
+    
+    for dir_path in dirs_to_create:
+        dir_path.mkdir(parents=True, exist_ok=True)
+    
+    # Get all subdirectories in source
+    subdirs = [d for d in source_path.iterdir() if d.is_dir()]
+    print(f"Found {len(subdirs)} directories to combine")
+    
+    # Count total files
+    total_files = 0
+    file_mapping = {"rgb_anet_resnet50": [], "rgb_as_flow": [], "target_perframe": []}
     
     for subdir in subdirs:
-        (output_path / subdir).mkdir(parents=True, exist_ok=True)
-    
-    # Track statistics
-    stats = {subdir: 0 for subdir in subdirs}
-    total_size = 0
-    
-    print(f"Combining {len(source_dirs)} directories into {output_dir}")
-    print(f"Operation: {'Moving' if move else 'Copying'} files\n")
-    
-    # Process each source directory
-    for source_dir in source_dirs:
-        source_path = Path(source_dir)
+        # RGB files
+        rgb_dir = subdir / "rgb_anet_resnet50"
+        if rgb_dir.exists():
+            files = list(rgb_dir.glob("*.npy"))
+            file_mapping["rgb_anet_resnet50"].extend([(f, subdir.name) for f in files])
+            total_files += len(files)
         
-        if not source_path.exists():
-            print(f"Warning: {source_dir} does not exist, skipping...")
-            continue
-            
-        print(f"Processing: {source_dir}")
+        # Flow files - handle special case with extra subdirectory
+        flow_dir = subdir / "rgb_as_flow"
+        if flow_dir.exists():
+            # Check if files are directly in rgb_as_flow
+            direct_files = list(flow_dir.glob("*.npy"))
+            if direct_files:
+                file_mapping["rgb_as_flow"].extend([(f, subdir.name) for f in direct_files])
+                total_files += len(direct_files)
+            else:
+                # Check for nested rgb_anet_resnet50 directory
+                nested_dir = flow_dir / "rgb_anet_resnet50"
+                if nested_dir.exists():
+                    files = list(nested_dir.glob("*.npy"))
+                    file_mapping["rgb_as_flow"].extend([(f, subdir.name) for f in files])
+                    total_files += len(files)
         
-        # Process each subdirectory
-        for subdir in subdirs:
-            src_subdir = source_path / subdir
-            dst_subdir = output_path / subdir
+        # Target files
+        target_dir = subdir / "target_perframe"
+        if target_dir.exists():
+            files = list(target_dir.glob("*.npy"))
+            file_mapping["target_perframe"].extend([(f, subdir.name) for f in files])
+            total_files += len(files)
+    
+    print(f"\nTotal files to copy: {total_files}")
+    print(f"RGB files: {len(file_mapping['rgb_anet_resnet50'])}")
+    print(f"Flow files: {len(file_mapping['rgb_as_flow'])}")
+    print(f"Target files: {len(file_mapping['target_perframe'])}")
+    
+    # Copy files with progress bar
+    with tqdm(total=total_files, desc="Copying files") as pbar:
+        for category, files in file_mapping.items():
+            output_category_dir = output_path / category
             
-            if not src_subdir.exists():
-                print(f"  Warning: {src_subdir} does not exist")
-                continue
-            
-            # Get all .npy files
-            npy_files = list(src_subdir.glob("*.npy"))
-            
-            # Process files with progress bar
-            for npy_file in tqdm(npy_files, desc=f"  {subdir}", unit="files"):
-                dst_file = dst_subdir / npy_file.name
+            for file_path, source_subdir in files:
+                # Check for duplicate filenames
+                dest_path = output_category_dir / file_path.name
+                if dest_path.exists():
+                    # Add source directory prefix to avoid conflicts
+                    new_name = f"{source_subdir}_{file_path.name}"
+                    dest_path = output_category_dir / new_name
+                    print(f"\nWarning: Duplicate filename {file_path.name}, renaming to {new_name}")
                 
-                # Handle naming conflicts
-                if dst_file.exists():
-                    # Check if files are identical
-                    if os.path.getsize(npy_file) == os.path.getsize(dst_file):
-                        print(f"\n  Skipping duplicate: {npy_file.name}")
-                        continue
-                    else:
-                        # Rename with source directory prefix
-                        new_name = f"{source_path.name}_{npy_file.name}"
-                        dst_file = dst_subdir / new_name
-                        print(f"\n  Renaming conflict: {npy_file.name} -> {new_name}")
-                
-                # Copy or move file
-                if move:
-                    shutil.move(str(npy_file), str(dst_file))
-                else:
-                    shutil.copy2(str(npy_file), str(dst_file))
-                
-                stats[subdir] += 1
-                total_size += os.path.getsize(dst_file)
+                shutil.copy2(file_path, dest_path)
+                pbar.update(1)
     
     # Print summary
-    print("\n=== Summary ===")
-    print(f"Output directory: {output_dir}")
-    for subdir, count in stats.items():
-        print(f"  {subdir}: {count} files")
-    print(f"Total files: {sum(stats.values())}")
-    print(f"Total size: {total_size / (1024**3):.2f} GB")
+    print(f"\n=== Combination Complete ===")
+    print(f"Output directory: {output_path}")
+    for category in ["rgb_anet_resnet50", "rgb_as_flow", "target_perframe"]:
+        count = len(list((output_path / category).glob("*.npy")))
+        print(f"{category}: {count} files")
     
-    # Verify completeness
-    print("\n=== Verification ===")
-    for subdir in subdirs:
-        actual_count = len(list((output_path / subdir).glob("*.npy")))
-        print(f"{subdir}: {actual_count} files in output")
+    return output_path
+
+
+def verify_structure(output_dir):
+    """Verify the combined dataset has correct structure"""
+    
+    print("\n=== Verifying Structure ===")
+    
+    # Check each video has all three components
+    output_path = Path(output_dir)
+    
+    # Get unique video names from each category
+    rgb_files = set(f.stem for f in (output_path / "rgb_anet_resnet50").glob("*.npy"))
+    flow_files = set(f.stem for f in (output_path / "rgb_as_flow").glob("*.npy"))
+    target_files = set(f.stem for f in (output_path / "target_perframe").glob("*.npy"))
+    
+    # Find videos with missing components
+    all_videos = rgb_files | flow_files | target_files
+    complete_videos = rgb_files & flow_files & target_files
+    
+    missing_rgb = all_videos - rgb_files
+    missing_flow = all_videos - flow_files
+    missing_target = all_videos - target_files
+    
+    print(f"Total unique videos: {len(all_videos)}")
+    print(f"Complete videos (all 3 components): {len(complete_videos)}")
+    
+    if missing_rgb:
+        print(f"Videos missing RGB: {len(missing_rgb)}")
+    if missing_flow:
+        print(f"Videos missing Flow: {len(missing_flow)}")
+    if missing_target:
+        print(f"Videos missing Target: {len(missing_target)}")
+    
+    if len(complete_videos) == len(all_videos):
+        print("✅ All videos have complete data!")
+    else:
+        print("⚠️  Some videos have missing components")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Combine multiple Assembly101-O datasets')
-    parser.add_argument('source_dirs', nargs='+', help='Source directories to combine')
-    parser.add_argument('-o', '--output', default='Assembly101-O_combined', 
-                        help='Output directory name (default: Assembly101-O_combined)')
-    parser.add_argument('-m', '--move', action='store_true', 
-                        help='Move files instead of copying')
+    parser = argparse.ArgumentParser(description='Combine multiple PREGO dataset directories')
+    parser.add_argument('source_dir', help='Directory containing multiple dataset subdirectories')
+    parser.add_argument('--output-dir', default='combined_data', 
+                        help='Output directory (default: combined_data)')
+    parser.add_argument('--dataset-name', default='Assembly101-O',
+                        choices=['Assembly101-O', 'Epic-tent-O'],
+                        help='Dataset name for output structure')
+    parser.add_argument('--verify', action='store_true',
+                        help='Verify structure after combining')
     
     args = parser.parse_args()
     
-    # Example usage for 8 directories
-    if len(args.source_dirs) == 1 and args.source_dirs[0] == 'auto':
-        # Auto-detect directories matching pattern
-        source_dirs = []
-        for i in range(1, 9):
-            dirs = [
-                f"Assembly101-O_{i}",
-                f"Assembly101-O_part{i}",
-                f"Assembly101-O-{i}",
-                f"assembly101_o_{i}"
-            ]
-            for d in dirs:
-                if Path(d).exists():
-                    source_dirs.append(d)
-                    break
-        
-        if not source_dirs:
-            print("No directories found. Please specify them manually.")
-            return
-    else:
-        source_dirs = args.source_dirs
+    # Check source directory exists
+    if not os.path.exists(args.source_dir):
+        print(f"Error: Source directory {args.source_dir} does not exist")
+        return
     
-    combine_datasets(source_dirs, args.output, args.move)
+    # Combine datasets
+    output_path = combine_datasets(args.source_dir, args.output_dir, args.dataset_name)
+    
+    # Verify if requested
+    if args.verify:
+        verify_structure(output_path)
 
 
 if __name__ == "__main__":
     main()
-
-# Example usage:
-# python combine_assembly_datasets.py Assembly101-O_1 Assembly101-O_2 Assembly101-O_3 Assembly101-O_4 Assembly101-O_5 Assembly101-O_6 Assembly101-O_7 Assembly101-O_8
-# 
-# Or if directories are named differently:
-# python combine_assembly_datasets.py dir1 dir2 dir3 dir4 dir5 dir6 dir7 dir8 -o Assembly101-O
-#
-# To move instead of copy (faster but removes originals):
-# python combine_assembly_datasets.py dir1 dir2 dir3 dir4 dir5 dir6 dir7 dir8 --move
